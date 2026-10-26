@@ -21,19 +21,30 @@ const KANBAN_LABEL = { backlog: 'Backlog', todo: 'Da fare', in_progress: 'In cor
 const TABS = [['uffici', 'Uffici'], ['chat', 'Chat'], ['automazioni', 'Automazioni'], ['output', 'Output'], ['progetti', 'Progetti']]
 
 async function api(path, opts) {
-  if (pluginCtx && pluginCtx.rest) {
-    const method = (opts && opts.method) || 'GET'
-    let body
-    if (opts && opts.body !== undefined) {
-      try { body = typeof opts.body === 'string' ? JSON.parse(opts.body) : opts.body }
-      catch (e) { body = opts.body }
+  try {
+    if (pluginCtx && pluginCtx.rest) {
+      const method = (opts && opts.method) || 'GET'
+      let body
+      if (opts && opts.body !== undefined) {
+        try { body = typeof opts.body === 'string' ? JSON.parse(opts.body) : opts.body }
+        catch (e) { body = opts.body }
+      }
+      return await pluginCtx.rest(path, body !== undefined ? { method, body } : { method })
     }
-    return pluginCtx.rest(path, body !== undefined ? { method, body } : { method })
+  } catch (e) {
+    lastErr = 'ctx.rest: ' + ((e && (e.message || e.detail || String(e))) || 'sconosciuto')
+    throw new Error(lastErr)
   }
-  const res = await fetch(API + path, opts)
-  if (!res.ok) throw new Error('HTTP ' + res.status)
-  return res.json()
+  try {
+    const res = await fetch(API + path, opts)
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    return res.json()
+  } catch (e) {
+    lastErr = 'fetch 8790: ' + ((e && (e.message || String(e))) || 'sconosciuto')
+    throw new Error(lastErr)
+  }
 }
+let lastErr = 'nessun tentativo ancora'
 
 function usePoll(path, intervalMs) {
   const [data, setData] = useState(null)
@@ -971,9 +982,13 @@ function GestionalePage() {
   const offline = Boolean(offices.err && agents.err && chats.err && autos.err)
     && !offices.data && !agents.data && !chats.data && !autos.data
   const status = offline ? 'backend offline' : 'live'
+  const diag = lastErr
 
   const body = offline
-    ? jsx('div', { className: 'flex-1 flex items-center justify-center', children: jsx(EmptyState, { label: 'backend offline' }) })
+    ? jsxs('div', { className: 'flex-1 flex flex-col items-center justify-center gap-2 p-4', children: [
+        jsx(EmptyState, { label: 'backend offline' }),
+        jsxs('div', { className: 'text-[0.65rem] text-(--ui-text-quaternary) max-w-md text-center break-all', children: ['diagnostica: ', diag] }),
+      ] })
     : tab === 'uffici'
       ? jsx(UfficiTab, { offices: data.offices, agents: data.agents, chats: data.chats, graphJson: graph.data })
       : tab === 'chat'

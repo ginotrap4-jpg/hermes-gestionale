@@ -1,11 +1,11 @@
-/** Gestionale Hermes — desktop plugin v0.2.
- * Sidebar /gestionale con tab: Uffici (canvas force-directed), Chat,
- * Automazioni (con dettaglio leggibile), Output (file explorer),
- * Progetti (kanban read-only + commenti). Profilo 'default' in basso.
+/** Gestionale Hermes — desktop plugin v0.3.
+ * Sidebar /gestionale con tab: Uffici (canvas force-directed monocromatico),
+ * Chat, Automazioni (last_run_at + Esegui ora + Log), Output (file explorer),
+ * Progetti (kanban read-only + commenti). Selettore profili in basso (?profile=).
  * Dati: ctx.rest verso /api/plugins/gestionale/ quando disponibile,
  * fallback a fetch http://127.0.0.1:8790 + polling (3s, 2s per il grafo).
  * Robusto a backend offline (EmptyState). Stile: solo variabili tema,
- * mai colori hardcoded (tranne i colori degli uffici che arrivano dai dati).
+ * mai colori hardcoded (canvas: toni di blu derivati da --accent).
  */
 import { cn, host, Button, Badge, EmptyState, StatusDot, Tip } from '@hermes/plugin-sdk'
 import { ROUTES_AREA, SIDEBAR_NAV_AREA, PALETTE_AREA } from '@hermes/plugin-sdk'
@@ -88,7 +88,54 @@ function fmtAgo(ts) {
 }
 
 function agentName(byId, id) {
-  return (byId[id] && byId[id].name) || id
+  return ((byId || {})[id] && (byId || {})[id].name) || id || '—'
+}
+
+/* Ultima esecuzione leggibile in italiano ('—' se assente) -------------- */
+function fmtLastRunIt(v) {
+  if (v === null || v === undefined || v === '') return '—'
+  try {
+    let d = null
+    if (typeof v === 'number') d = new Date(v < 1e12 ? v * 1000 : v)
+    else if (typeof v === 'string' && /^[0-9]+$/.test(v.trim())) {
+      const n = Number(v.trim())
+      d = new Date(n < 1e12 ? n * 1000 : n)
+    } else d = new Date(v)
+    if (!d || isNaN(d.getTime())) return String(v)
+    try {
+      return d.toLocaleString('it-IT', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
+    } catch (e2) {
+      try { return d.toLocaleString() } catch (e3) { return String(v) }
+    }
+  } catch (e) { return String(v) }
+}
+
+/* Palette monocromatica blu derivata da --accent --------------------------
+ * hue estratto dall'accent esadecimale (fallback 217 = blu Hermes),
+ * lightness variabile per indice: toni di blu, niente altri colori. */
+function accentHue(accent) {
+  try {
+    const m = /^#([0-9a-f]{6})$/i.exec((accent || '').trim())
+    if (!m) return 217
+    const r = parseInt(m[1].slice(0, 2), 16) / 255
+    const g = parseInt(m[1].slice(2, 4), 16) / 255
+    const b = parseInt(m[1].slice(4, 6), 16) / 255
+    const mx = Math.max(r, g, b)
+    const mn = Math.min(r, g, b)
+    if (mx === mn) return 217
+    const d = mx - mn
+    let h = 0
+    if (mx === r) h = ((g - b) / d + (g < b ? 6 : 0)) * 60
+    else if (mx === g) h = ((b - r) / d + 2) * 60
+    else h = ((r - g) / d + 4) * 60
+    return Math.round(h) || 217
+  } catch (e) { return 217 }
+}
+
+function monoBlue(i, accent) {
+  const h = accentHue(accent)
+  const l = 34 + ((Number(i) || 0) * 9) % 28 // 34%..61%
+  return 'hsl(' + h + ', 58%, ' + l + '%)'
 }
 
 /* Grafo uffici -----------------------------------------------------------
@@ -97,7 +144,7 @@ function agentName(byId, id) {
  * numero di messaggi, e avvicina i nodi collegati.
  */
 function deriveGraph(offices, agents, chats, graphJson) {
-  const nodes = (offices || []).map((o) => ({ id: o.id, name: o.name, color: o.color || '#888' }))
+  const nodes = (offices || []).filter((o) => o && (o.id || o.name)).map((o) => ({ id: o.id || o.name, name: o.name || o.id }))
   if (graphJson && (graphJson.edges || graphJson.links || graphJson.nodes)) {
     const seed = {}
     ;(graphJson.nodes || []).forEach((n) => { seed[n.id] = n })
@@ -155,7 +202,7 @@ function OfficesCanvas({ nodes, edges, seed, selectedId, onNodeClick, onEdgeClic
     if (!wrap || !canvas) return undefined
     const ctx = canvas.getContext('2d')
     const size = { w: 300, h: 300, dpr: 1 }
-    let colors = { text: '#999', faint: '#777', stroke: '#555', accent: '#7aa2f7', bubble: '#fff', bubbleSub: '#bbb' }
+    let colors = { text: '#999', faint: '#777', stroke: '#555', accent: '#7aa2f7', bubble: '#fff', bubbleSub: '#bbb', panel: '#111' }
     const pos = new Map() // id -> {x,y,vx,vy}
     let mouse = null
     let hoverEdge = null
@@ -168,12 +215,13 @@ function OfficesCanvas({ nodes, edges, seed, selectedId, onNodeClick, onEdgeClic
         const cs = getComputedStyle(canvas)
         const g = (n, fb) => (cs.getPropertyValue(n) || '').trim() || fb
         colors = {
-          text: g('--ui-text-secondary', '#999'),
-          faint: g('--ui-text-quaternary', '#777'),
-          stroke: g('--ui-stroke-secondary', '#555'),
-          accent: g('--ui-accent', '#7aa2f7'),
-          bubble: g('--ui-text-primary', '#fff'),
-          bubbleSub: g('--ui-text-tertiary', '#bbb'),
+          text: g('--ui-text-secondary', g('--foreground', '#999')),
+          faint: g('--ui-text-quaternary', g('--muted-foreground', '#777')),
+          stroke: g('--ui-stroke-secondary', g('--border', '#555')),
+          accent: g('--ui-accent', g('--accent', '#7aa2f7')),
+          bubble: g('--ui-text-primary', g('--foreground', '#fff')),
+          bubbleSub: g('--ui-text-tertiary', g('--muted-foreground', '#bbb')),
+          panel: g('--card', '#111'),
         }
       } catch (e) { /* tema non leggibile, fallback ok */ }
     }
@@ -288,19 +336,22 @@ function OfficesCanvas({ nodes, edges, seed, selectedId, onNodeClick, onEdgeClic
     const draw = () => {
       const cur = dataRef.current
       ctx.setTransform(size.dpr, 0, 0, size.dpr, 0, 0)
-      ctx.clearRect(0, 0, size.w, size.h)
-      // lati
+      ctx.clearRect(0, 0, size.w, size.h) // sfondo trasparente (nessun fill)
+      // lati: grigio/blu tenue, opacità ~.4, spessore = peso messaggi
       ;(cur.edges || []).forEach((e) => {
         if (!pos.has(e.a) || !pos.has(e.b)) return
         const a = pos.get(e.a)
         const b = pos.get(e.b)
         const hot = hoverEdge && hoverEdge.key === e.key
+        ctx.save()
+        ctx.globalAlpha = hot ? 0.9 : 0.4
         ctx.beginPath()
         ctx.moveTo(a.x, a.y)
         ctx.lineTo(b.x, b.y)
         ctx.strokeStyle = hot ? colors.accent : colors.stroke
-        ctx.lineWidth = hot ? 3 : 1 + Math.min(3, (Number(e.weight) || 1) / 8)
+        ctx.lineWidth = hot ? 3 : 1 + Math.min(4, (Number(e.weight) || Number(e.count) || 1) / 6)
         ctx.stroke()
+        ctx.restore()
         if (hot) {
           const mx = (a.x + b.x) / 2
           const my = (a.y + b.y) / 2
@@ -314,7 +365,7 @@ function OfficesCanvas({ nodes, edges, seed, selectedId, onNodeClick, onEdgeClic
           const bx = Math.min(Math.max(4, mx - bw / 2), Math.max(4, size.w - bw - 4))
           const by = Math.max(4, my - 46)
           roundRect(bx, by, bw, 40, 6)
-          ctx.fillStyle = 'rgba(0,0,0,0.82)'
+          ctx.fillStyle = colors.panel
           ctx.fill()
           ctx.strokeStyle = colors.accent
           ctx.lineWidth = 1
@@ -327,14 +378,19 @@ function OfficesCanvas({ nodes, edges, seed, selectedId, onNodeClick, onEdgeClic
           ctx.fillText(sub, bx + 8, by + 31)
         }
       })
-      // nodi
-      ;(cur.nodes || []).forEach((n) => {
+      // nodi: palette monocromatica Hermes (toni di blu da --accent)
+      ;(cur.nodes || []).forEach((n, idx) => {
         const p = P(n.id)
         const R = 24
         ctx.beginPath()
         ctx.arc(p.x, p.y, R, 0, Math.PI * 2)
-        ctx.fillStyle = n.color || '#888'
+        ctx.fillStyle = monoBlue(idx, colors.accent)
         ctx.fill()
+        ctx.beginPath()
+        ctx.arc(p.x, p.y, R, 0, Math.PI * 2)
+        ctx.strokeStyle = colors.stroke
+        ctx.lineWidth = 1
+        ctx.stroke()
         if (selRef.current === n.id) {
           ctx.beginPath()
           ctx.arc(p.x, p.y, R + 4, 0, Math.PI * 2)
@@ -345,7 +401,7 @@ function OfficesCanvas({ nodes, edges, seed, selectedId, onNodeClick, onEdgeClic
         ctx.fillStyle = colors.text
         ctx.font = '11px sans-serif'
         ctx.textAlign = 'center'
-        ctx.fillText(n.name, p.x, p.y + R + 14)
+        ctx.fillText(n.name || n.id || '', p.x, p.y + R + 14)
         ctx.textAlign = 'left'
       })
     }
@@ -444,16 +500,17 @@ function OfficesCanvas({ nodes, edges, seed, selectedId, onNodeClick, onEdgeClic
 }
 
 function AgentLine({ agent }) {
-  const pct = pctOf(agent.progress)
+  const a = (agent && typeof agent === 'object') ? agent : {}
+  const pct = pctOf(a.progress)
   return jsxs('div', {
     className: 'rounded-md border border-(--ui-stroke-secondary) p-2 flex flex-col gap-1',
     children: [
       jsxs('div', {
         key: 'h', className: 'flex items-center gap-1.5',
         children: [
-          jsx(StatusDot, { key: 'd', state: dotFor(agent.state) }),
-          jsx('span', { key: 'n', className: 'text-xs font-medium truncate', children: agent.name }),
-          jsx('span', { key: 's', className: 'ml-auto text-[0.6rem] text-(--ui-text-quaternary)', children: agent.state }),
+          jsx(StatusDot, { key: 'd', state: dotFor(a.state) }),
+          jsx('span', { key: 'n', className: 'text-xs font-medium truncate', children: a.name || a.id || '—' }),
+          jsx('span', { key: 's', className: 'ml-auto text-[0.6rem] text-(--ui-text-quaternary)', children: a.state || '' }),
         ],
       }),
       jsx('div', {
@@ -462,7 +519,7 @@ function AgentLine({ agent }) {
       }),
       jsx('div', {
         key: 'act', className: 'text-[0.6875rem] text-(--ui-text-tertiary) leading-snug',
-        children: (agent.goal || 'in attesa di mansione') + ' · ' + pct + '% · ' + fmtAgo(agent.heartbeat_at || agent.started_at),
+        children: (a.goal || 'in attesa di mansione') + ' · ' + pct + '% · ' + fmtAgo(a.heartbeat_at || a.started_at),
       }),
     ],
   })
@@ -601,67 +658,113 @@ function ChatTab({ chats, agents }) {
 
 /* Automazioni: righe + dettaglio in italiano non-tecnico ------------------ */
 function autoStepsFallback(a) {
+  const src = (a || {}).source === 'hermes_cron' ? 'un controllo pianificato del sistema' : 'il motore interno delle automazioni'
   const steps = []
-  steps.push({ t: 'Quando parte', d: a.schedule_raw ? 'Si attiva con questa cadenza: ' + a.schedule_raw + '.' : 'Parte quando serve (nessuna cadenza impostata).' })
-  const src = a.source === 'hermes_cron' ? 'un controllo pianificato del sistema' : 'il motore interno delle automazioni'
-  steps.push({ t: 'Cosa fa', d: 'È ' + src + ' e si chiama «' + a.name + '».' })
-  if (a.office_id) steps.push({ t: 'Chi se ne occupa', d: 'Ufficio di riferimento: ' + a.office_id + '.' })
-  const last = a.last_run_status
-    ? 'Ultima esecuzione: ' + (a.last_run_status === 'ok' ? 'tutto bene' : a.last_run_status) + (a.last_run_ts ? ' (' + fmtAgo(a.last_run_ts) + ')' : '') + '.'
-    : 'Non risulta ancora eseguita.'
-  steps.push({ t: 'Stato', d: last + (a.enabled ? ' Al momento è accesa.' : ' Al momento è spenta.') })
+  steps.push({ t: 'Quando parte', d: (a || {}).schedule_raw ? 'Si attiva con questa cadenza: ' + a.schedule_raw + '.' : 'Parte quando serve (nessuna cadenza impostata).' })
+  steps.push({ t: 'Cosa fa', d: 'È ' + src + ' e si chiama «' + ((a || {}).name || (a || {}).id || '—') + '».' })
+  if ((a || {}).office_id) steps.push({ t: 'Chi se ne occupa', d: 'Ufficio di riferimento: ' + a.office_id + '.' })
+  const st = (a || {}).last_run_status
+    ? 'Ultima esecuzione: ' + ((a || {}).last_run_status === 'ok' ? 'tutto bene' : a.last_run_status)
+    : 'Non risulta ancora eseguita'
+  const when = fmtLastRunIt((a || {}).last_run_at || (a || {}).last_run_ts)
+  steps.push({ t: 'Stato', d: st + ' (' + when + ').' + ((a || {}).enabled ? ' Al momento è accesa.' : ' Al momento è spenta.') })
   return steps
 }
 
-function AutomationsTab({ automations }) {
+function AutomationsTab({ automations, profile }) {
   const [selId, setSelId] = useState(null)
   const [detail, setDetail] = useState(null)
   const [detailErr, setDetailErr] = useState(null)
   const [rows, setRows] = useState(automations || [])
+  const [runMsg, setRunMsg] = useState(null) // {id, ok, text}
+  const [running, setRunning] = useState(false)
+  const [logOpen, setLogOpen] = useState(false)
+  const [logText, setLogText] = useState(null)
+  const [logErr, setLogErr] = useState(null)
+  const [logLoading, setLogLoading] = useState(false)
   useEffect(() => { setRows(automations || []) }, [automations])
-  const sel = (rows || []).find((a) => a.id === selId) || null
+  const q = '?profile=' + encodeURIComponent(profile || 'default')
+  const sel = (rows || []).find((a) => (a || {}).id === selId) || null
 
   useEffect(() => {
-    if (!selId) { setDetail(null); setDetailErr(null); return undefined }
+    if (!selId) { setDetail(null); setDetailErr(null); setRunMsg(null); setLogOpen(false); setLogText(null); setLogErr(null); return undefined }
     let alive = true
-    setDetail(null); setDetailErr(null)
-    api('/automations/' + selId + '/detail')
+    setDetail(null); setDetailErr(null); setRunMsg(null); setLogOpen(false); setLogText(null); setLogErr(null)
+    api('/automations/' + selId + '/detail' + q)
       .then((d) => { if (alive) setDetail(d) })
-      .catch((e) => { if (alive) setDetailErr(e.message || 'errore') })
+      .catch((e) => { if (alive) setDetailErr((e && (e.message || String(e))) || 'errore') })
     return () => { alive = false }
-  }, [selId])
+  }, [selId, profile])
 
   const toggle = (a) => {
-    const on = !a.enabled
-    setRows((prev) => (prev || []).map((r) => (r.id === a.id ? { ...r, enabled: on ? 1 : 0 } : r)))
-    api('/automations/' + a.id + '/toggle?enabled=' + (on ? '1' : '0'), {
+    const on = !(a || {}).enabled
+    setRows((prev) => (prev || []).map((r) => ((r || {}).id === (a || {}).id ? { ...r, enabled: on ? 1 : 0 } : r)))
+    api('/automations/' + (a || {}).id + '/toggle?enabled=' + (on ? '1' : '0') + '&profile=' + encodeURIComponent(profile || 'default'), {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ enabled: on }),
     }).catch(() => {
-      setRows((prev) => (prev || []).map((r) => (r.id === a.id ? { ...r, enabled: a.enabled } : r)))
+      setRows((prev) => (prev || []).map((r) => ((r || {}).id === (a || {}).id ? { ...r, enabled: (a || {}).enabled } : r)))
     })
+  }
+
+  const runNow = (a) => {
+    if (running) return
+    setRunning(true); setRunMsg(null)
+    api('/automations/' + (a || {}).id + '/run-now' + q, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) })
+      .then(() => { setRunMsg({ id: (a || {}).id, ok: true, text: 'Esecuzione avviata.' }) })
+      .catch((e) => {
+        const m = (e && (e.message || String(e))) || 'errore'
+        setRunMsg({ id: (a || {}).id, ok: false, text: /404/.test(m) ? 'Esecuzione manuale non ancora disponibile.' : 'Avvio non riuscito (' + m + ').' })
+      })
+      .finally(() => setRunning(false))
+  }
+
+  const loadLogs = (a) => {
+    if (logOpen) { setLogOpen(false); return }
+    setLogOpen(true); setLogLoading(true); setLogText(null); setLogErr(null)
+    api('/automations/' + (a || {}).id + '/logs' + q)
+      .then((d) => {
+        if (!d || (d.logs === undefined && d.output === undefined && d.text === undefined && !Array.isArray(d))) {
+          setLogErr('log non disponibile')
+          return
+        }
+        const arr = Array.isArray(d) ? d : (d.logs || d.output || d.lines || [])
+        if (Array.isArray(arr)) {
+          if (!arr.length) { setLogErr('log non disponibile'); return }
+          setLogText(arr.map((l) => (typeof l === 'string' ? l : (l && (l.text || l.message || JSON.stringify(l))) || '')).join('\n'))
+        } else {
+          const t = d.text || d.output || ''
+          if (!t) { setLogErr('log non disponibile'); return }
+          setLogText(String(t))
+        }
+      })
+      .catch(() => setLogErr('log non disponibile'))
+      .finally(() => setLogLoading(false))
   }
 
   const detailSteps = (() => {
     if (!sel) return []
-    if (detail) {
+    if (detail && typeof detail === 'object') {
       const arr = detail.steps || detail.composition || detail.stages || detail.passaggi || null
       if (Array.isArray(arr) && arr.length) {
         return arr.map((s, i) => {
           if (typeof s === 'string') return { t: 'Passo ' + (i + 1), d: s }
+          const o = (s && typeof s === 'object') ? s : {}
           return {
-            t: s.title || s.nome || s.name || ('Passo ' + (i + 1)),
-            d: [s.description || s.descrizione || s.detail || '', s.script ? 'Script: ' + s.script : '', s.file ? 'File: ' + s.file : '']
+            t: o.title || o.nome || o.name || ('Passo ' + (i + 1)),
+            d: [o.description || o.descrizione || o.detail || '', o.script ? 'Script: ' + o.script : '', o.file ? 'File: ' + o.file : '']
               .filter(Boolean).join(' — ') || '—',
           }
         })
       }
       if (detail.description || detail.descrizione) {
-        return [{ t: sel.name, d: detail.description || detail.descrizione }]
+        return [{ t: (sel || {}).name || 'Automazione', d: detail.description || detail.descrizione }]
       }
     }
     return autoStepsFallback(sel)
   })()
+
+  const selLastRun = fmtLastRunIt((sel || {}).last_run_at || (sel || {}).last_run_ts)
 
   return jsxs('div', {
     className: 'flex h-full gap-2 p-2',
@@ -669,24 +772,24 @@ function AutomationsTab({ automations }) {
       jsxs('div', {
         key: 'list', className: 'flex-1 flex flex-col gap-1.5 overflow-auto',
         children: (rows || []).length ? rows.map((a) => jsxs('div', {
-          key: a.id,
+          key: (a || {}).id || (a || {}).name,
           className: cn('rounded-md border p-2 flex items-center gap-2 cursor-pointer transition-colors',
-            selId === a.id ? 'border-(--ui-accent)' : 'border-(--ui-stroke-secondary) hover:bg-(--chrome-action-hover)'),
-          onClick: () => setSelId(selId === a.id ? null : a.id),
+            selId === (a || {}).id ? 'border-(--ui-accent)' : 'border-(--ui-stroke-secondary) hover:bg-(--chrome-action-hover)'),
+          onClick: () => setSelId(selId === (a || {}).id ? null : (a || {}).id),
           children: [
-            jsx(StatusDot, { key: 'd', state: a.enabled ? 'online' : 'idle' }),
+            jsx(StatusDot, { key: 'd', state: (a || {}).enabled ? 'online' : 'idle' }),
             jsxs('div', {
               key: 'm', className: 'flex-1 min-w-0',
               children: [
-                jsx('div', { key: 'n', className: 'text-xs truncate', children: a.name }),
-                jsx('div', { key: 's', className: 'text-[0.6rem] text-(--ui-text-quaternary) truncate', children: (a.source === 'hermes_cron' ? 'cron' : 'motore') + ' · ' + (a.schedule_raw || 'senza cadenza') }),
+                jsx('div', { key: 'n', className: 'text-xs truncate', children: (a || {}).name || (a || {}).id || '—' }),
+                jsx('div', { key: 's', className: 'text-[0.6rem] text-(--ui-text-quaternary) truncate', children: ((a || {}).source === 'hermes_cron' ? 'cron' : 'motore') + ' · ' + ((a || {}).schedule_raw || 'senza cadenza') + ' · ultima: ' + fmtLastRunIt((a || {}).last_run_at || (a || {}).last_run_ts) }),
               ],
             }),
-            jsx('div', { key: 'l', className: 'text-[0.6rem] text-(--ui-text-tertiary)', children: a.last_run_status === 'ok' ? 'ok' : (a.last_run_status || '—') }),
+            jsx('div', { key: 'l', className: 'text-[0.6rem] text-(--ui-text-tertiary)', children: (a || {}).last_run_status === 'ok' ? 'ok' : ((a || {}).last_run_status || '—') }),
             jsx(Button, {
               key: 't', size: 'sm', variant: 'ghost', type: 'button',
               onClick: (ev) => { ev.stopPropagation(); toggle(a) },
-              children: a.enabled ? 'Off' : 'On',
+              children: (a || {}).enabled ? 'Off' : 'On',
             }),
           ],
         })) : [jsx(EmptyState, { key: 'e', label: 'Nessuna automazione' })],
@@ -697,17 +800,37 @@ function AutomationsTab({ automations }) {
           jsxs('div', {
             key: 'h', className: 'flex items-center gap-2',
             children: [
-              jsx(StatusDot, { key: 'd', state: sel.enabled ? 'online' : 'idle' }),
-              jsx('span', { key: 'n', className: 'text-xs font-medium flex-1 truncate', children: sel.name }),
+              jsx(StatusDot, { key: 'd', state: (sel || {}).enabled ? 'online' : 'idle' }),
+              jsx('span', { key: 'n', className: 'text-xs font-medium flex-1 truncate', children: (sel || {}).name || (sel || {}).id || '—' }),
               jsx(Button, { key: 'x', size: 'sm', variant: 'ghost', type: 'button', onClick: () => setSelId(null), children: '✕' }),
             ],
           }),
+          jsx('div', { key: 'lr', className: 'text-[0.65rem] text-(--ui-text-tertiary)', children: 'Ultima esecuzione: ' + selLastRun }),
+          jsxs('div', {
+            key: 'actions', className: 'flex items-center gap-1.5',
+            children: [
+              jsx(Button, { key: 'run', size: 'sm', type: 'button', onClick: () => runNow(sel), children: running ? 'Avvio…' : 'Esegui ora' }),
+              jsx(Button, { key: 'log', size: 'sm', variant: 'ghost', type: 'button', onClick: () => loadLogs(sel), children: logOpen ? 'Nascondi log' : 'Log' }),
+            ],
+          }),
+          (runMsg && runMsg.id === (sel || {}).id) ? jsx('div', { key: 'rm', className: 'text-[0.65rem] text-(--ui-text-tertiary)', children: runMsg.text }) : null,
+          logOpen ? jsxs('div', {
+            key: 'logbox', className: 'rounded-md border border-(--ui-stroke-secondary) p-2 flex flex-col gap-1',
+            children: [
+              jsx('div', { key: 'lt', className: 'text-[0.62rem] uppercase tracking-wide text-(--ui-text-quaternary)', children: 'Log' }),
+              logLoading
+                ? jsx('div', { key: 'll', className: 'text-[0.65rem] text-(--ui-text-quaternary)', children: 'Caricamento…' })
+                : logErr
+                  ? jsx('div', { key: 'le', className: 'text-[0.65rem] text-(--ui-text-quaternary)', children: logErr })
+                  : jsx('pre', { key: 'lp', className: 'text-[0.65rem] text-(--ui-text-secondary) whitespace-pre-wrap break-all max-h-48 overflow-auto', children: logText || '' }),
+            ],
+          }) : null,
           detailErr ? jsx('div', { key: 'w', className: 'text-[0.65rem] text-(--ui-text-quaternary)', children: 'Dettaglio server non disponibile, mostro il riepilogo.' }) : null,
           ...detailSteps.map((s, i) => jsxs('div', {
             key: 's' + i, className: 'flex flex-col gap-0.5',
             children: [
-              jsx('div', { key: 't', className: 'text-[0.6875rem] font-medium text-(--ui-text-secondary)', children: (i + 1) + '. ' + s.t }),
-              jsx('div', { key: 'd', className: 'text-[0.7rem] text-(--ui-text-tertiary) leading-relaxed', children: s.d }),
+              jsx('div', { key: 't', className: 'text-[0.6875rem] font-medium text-(--ui-text-secondary)', children: (i + 1) + '. ' + (s.t || '') }),
+              jsx('div', { key: 'd', className: 'text-[0.7rem] text-(--ui-text-tertiary) leading-relaxed', children: s.d || '—' }),
             ],
           })),
         ],
@@ -768,6 +891,7 @@ function OutputTab() {
 
 /* Progetti: kanban read-only + commenti ----------------------------------- */
 function colOf(t) {
+  if (!t || typeof t !== 'object') return 'backlog'
   if (t.status && KANBAN.indexOf(t.status) >= 0) return t.status
   const p = Number(t.progress || 0)
   if (p >= 1) return 'done'
@@ -779,9 +903,11 @@ function colOf(t) {
 function synthTasks(projects) {
   const out = []
   ;(projects || []).forEach((pr) => {
+    if (!pr || typeof pr !== 'object') return
     ;(pr.missions || []).forEach((m) => {
+      if (!m || typeof m !== 'object') return
       out.push({
-        id: m.id, project_id: pr.id, project_name: pr.name, title: m.title,
+        id: m.id, project_id: pr.id, project_name: pr.name || '', title: m.title || m.id || '—',
         description: '', status: null, progress: m.progress || 0,
         assignee: m.office_id || '', priority: '—', subtasks: 0,
         comments: [], lastComment: '',
@@ -791,34 +917,35 @@ function synthTasks(projects) {
   return out
 }
 
-function TaskDetail({ task, projectName, onClose }) {
+function TaskDetail({ task, projectName, onClose, profile }) {
   const [remote, setRemote] = useState(null)
   const [text, setText] = useState('')
   const [sending, setSending] = useState(false)
   const [sendErr, setSendErr] = useState(null)
   const [localComments, setLocalComments] = useState([])
+  const qp = '?profile=' + encodeURIComponent(profile || 'default')
   useEffect(() => {
     let alive = true
-    api('/tasks/' + task.id)
-      .then((d) => { if (alive) setRemote(d.task || d) })
+    api('/tasks/' + (task || {}).id + qp)
+      .then((d) => { if (alive) setRemote((d && (d.task || d)) || null) })
       .catch(() => { if (alive) setRemote(null) })
     return () => { alive = false }
-  }, [task.id])
-  const full = { ...task, ...(remote || {}) }
+  }, [(task || {}).id, profile])
+  const full = { ...(task || {}), ...((remote && typeof remote === 'object') ? remote : {}) }
   const thread = [...(full.comments || []), ...localComments]
   const send = () => {
-    const t = text.trim()
+    const t = (text || '').trim()
     if (!t || sending) return
     setSending(true); setSendErr(null)
-    api('/tasks/' + task.id + '/comment', {
+    api('/tasks/' + (task || {}).id + '/comment' + qp, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ author: 'user', text: t }),
     })
       .then(() => {
-        setLocalComments((prev) => [...prev, { author: 'user', text: t, ts: Date.now() / 1000 }])
+        setLocalComments((prev) => [...(prev || []), { author: 'user', text: t, ts: Date.now() / 1000 }])
         setText('')
       })
-      .catch((e) => setSendErr(e.message || 'errore'))
+      .catch((e) => setSendErr((e && (e.message || String(e))) || 'errore'))
       .finally(() => setSending(false))
   }
   return jsxs('div', {
@@ -864,7 +991,7 @@ function TaskDetail({ task, projectName, onClose }) {
   })
 }
 
-function ProjectsTab({ projects, tasksData, agents, offices }) {
+function ProjectsTab({ projects, tasksData, agents, offices, profile }) {
   const [selId, setSelId] = useState(null)
   const agentById = useMemo(() => {
     const m = {}
@@ -955,30 +1082,83 @@ function ProjectsTab({ projects, tasksData, agents, offices }) {
           })
         }) : [jsx(EmptyState, { key: 'e', label: 'Nessun progetto' })],
       }),
-      sel ? jsx(TaskDetail, { key: 'd', task: sel, projectName: sel.project_name, onClose: () => setSelId(null) }) : null,
+      sel ? jsx(TaskDetail, { key: 'd', task: sel, projectName: sel.project_name, profile, onClose: () => setSelId(null) }) : null,
     ],
   })
 }
 
 /* Pagina ------------------------------------------------------------------ */
+function useProfiles() {
+  const [profiles, setProfiles] = useState([{ id: 'default', name: 'default' }])
+  useEffect(() => {
+    let alive = true
+    api('/profiles')
+      .then((d) => {
+        if (!alive) return
+        const raw = (d && (d.profiles || d.items || d.data)) || d
+        const arr = Array.isArray(raw) ? raw : (raw && typeof raw === 'object' && Array.isArray(raw.profiles) ? raw.profiles : [])
+        if (Array.isArray(arr) && arr.length) {
+          setProfiles(arr.map((p) => (typeof p === 'string'
+            ? { id: p, name: p }
+            : { id: (p && (p.id || p.name)) || 'default', name: (p && (p.name || p.id)) || 'default' })))
+        }
+      })
+      .catch(() => { /* fallback: solo default */ })
+    return () => { alive = false }
+  }, [])
+  return profiles
+}
+
+function loadProfile() {
+  try {
+    if (pluginCtx && pluginCtx.storage && typeof pluginCtx.storage.get === 'function') {
+      return pluginCtx.storage.get('profile').then((v) => v || null).catch(() => null)
+    }
+  } catch (e) { /* storage ctx non disponibile */ }
+  return Promise.resolve(null)
+}
+
+function saveProfile(id) {
+  try {
+    if (typeof localStorage !== 'undefined') localStorage.setItem('gestionale.profile', id)
+  } catch (e) { /* localStorage non disponibile */ }
+  try {
+    if (pluginCtx && pluginCtx.storage && typeof pluginCtx.storage.set === 'function') pluginCtx.storage.set('profile', id)
+  } catch (e) { /* storage ctx non disponibile */ }
+}
+
 function GestionalePage() {
   const [tab, setTab] = useState('uffici')
-  const offices = usePoll('/offices', 3000)
-  const agents = usePoll('/agents', 3000)
-  const chats = usePoll('/chats', 3000)
-  const autos = usePoll('/automations', 3000)
-  const graph = usePoll('/graph', 2000)
-  const tasks = usePoll('/tasks', 3000)
-  const projects = usePoll('/projects', 3000)
+  const profiles = useProfiles()
+  const [profile, setProfile] = useState(() => {
+    try {
+      if (typeof localStorage !== 'undefined') return localStorage.getItem('gestionale.profile') || 'default'
+    } catch (e) { /* localStorage non disponibile */ }
+    return 'default'
+  })
+  useEffect(() => {
+    let alive = true
+    loadProfile().then((v) => { if (alive && v) setProfile(v) })
+    return () => { alive = false }
+  }, [])
+  const q = '?profile=' + encodeURIComponent(profile || 'default')
+  const onProfile = (id) => { setProfile(id || 'default'); saveProfile(id || 'default') }
+  const offices = usePoll('/offices' + q, 3000)
+  const agents = usePoll('/agents' + q, 3000)
+  const chats = usePoll('/chats' + q, 3000)
+  const autos = usePoll('/automations' + q, 3000)
+  const graph = usePoll('/graph' + q, 2000)
+  const tasks = usePoll('/tasks' + q, 3000)
+  const projects = usePoll('/projects' + q, 3000)
 
   const data = {
-    offices: (offices.data && offices.data.offices) || [],
-    agents: (agents.data && agents.data.agents) || [],
-    chats: (chats.data && chats.data.chats) || [],
-    automations: (autos.data && autos.data.automations) || [],
-    projects: (projects.data && projects.data.projects) || [],
+    offices: ((offices.data && offices.data.offices) || []),
+    agents: ((agents.data && agents.data.agents) || []),
+    chats: ((chats.data && chats.data.chats) || []),
+    automations: ((autos.data && autos.data.automations) || []),
+    projects: ((projects.data && projects.data.projects) || []),
   }
-  const running = data.agents.filter((a) => a.state === 'RUNNING').length
+  const running = (data.agents || []).filter((a) => (a || {}).state === 'RUNNING').length
   const offline = Boolean(offices.err && agents.err && chats.err && autos.err)
     && !offices.data && !agents.data && !chats.data && !autos.data
   const status = offline ? 'backend offline' : 'live'
@@ -994,10 +1174,10 @@ function GestionalePage() {
       : tab === 'chat'
         ? jsx(ChatTab, { chats: data.chats, agents: data.agents })
         : tab === 'automazioni'
-          ? jsx(AutomationsTab, { automations: data.automations })
+          ? jsx(AutomationsTab, { automations: data.automations, profile })
           : tab === 'output'
             ? jsx(OutputTab, {})
-            : jsx(ProjectsTab, { projects: data.projects, tasksData: tasks.data, agents: data.agents, offices: data.offices })
+            : jsx(ProjectsTab, { projects: data.projects, tasksData: tasks.data, agents: data.agents, offices: data.offices, profile })
 
   return jsxs('div', {
     className: 'flex h-full flex-col',
@@ -1024,7 +1204,15 @@ function GestionalePage() {
         key: 'profile', className: 'flex items-center gap-1.5 px-3 py-1.5 border-t border-(--ui-stroke-primary)',
         children: [
           jsx(StatusDot, { key: 'd', state: 'online' }),
-          jsx('span', { key: 'n', className: 'text-[0.7rem] text-(--ui-text-tertiary)', children: 'default' }),
+          jsx('span', { key: 'pl', className: 'text-[0.7rem] text-(--ui-text-quaternary)', children: 'Profilo' }),
+          jsx('select', {
+            key: 'sel',
+            value: (profiles || []).some((p) => (p || {}).id === profile) ? profile : 'default',
+            onChange: (ev) => onProfile(ev && ev.target ? ev.target.value : 'default'),
+            className: 'text-[0.7rem] text-(--ui-text-tertiary) bg-transparent rounded border border-(--ui-stroke-secondary) px-1 py-0.5',
+            children: ((profiles || []).length ? profiles : [{ id: 'default', name: 'default' }]).map((p) =>
+              jsx('option', { key: (p || {}).id || 'default', value: (p || {}).id || 'default', children: (p || {}).name || (p || {}).id || 'default' })),
+          }),
         ],
       }),
     ],

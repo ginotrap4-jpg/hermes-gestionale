@@ -27,10 +27,20 @@ sys.path.insert(0, "/opt/data/output/gestionale/backend")
 
 import state  # noqa: E402
 import demo_feed as _demo  # noqa: E402  (constants + idempotent seed only)
+import engine as _engine  # noqa: E402  (automation engine: schedule + run)
 
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Automation Engine: thread daemon solo nel processo del web server
+# (guardia dentro maybe_start: non parte mai con GESTIONALE_ENGINE=0
+# né dallo standalone server.py:8790).
+try:
+    _engine_started = _engine.maybe_start()
+except Exception as exc:  # mai rompere l'import del plugin
+    log.warning("gestionale engine not started: %s", exc)
+    _engine_started = False
 
 _seed_lock = threading.Lock()
 
@@ -75,21 +85,38 @@ def _activity_for(agent_id: str, now: float) -> str:
     return _ACTIVITY_POOL[slot % len(_ACTIVITY_POOL)]
 
 
+# --- Profiles (profili Hermes reali da filesystem) --------------------------
+
+@router.get("/profiles")
+def profiles():
+    _db()
+    return {"profiles": _engine.list_profiles()}
+
+
+def _profile_filter(profile: str | None) -> tuple[str, tuple]:
+    if profile:
+        return " WHERE profile=?", (profile,)
+    return "", ()
+
+
 # --- Offices / agents / chats / automations ----------------------------------
 
 @router.get("/offices")
-def offices():
+def offices(profile: str | None = None):
     st = _db()
-    rows = st.query("SELECT * FROM offices")
+    where, args = _profile_filter(profile)
+    rows = st.query(f"SELECT * FROM offices{where}", args)
     for r in rows:
         r["allowed_toolsets"] = st.jload(r["allowed_toolsets"])
     return {"offices": rows}
 
 
 @router.get("/agents")
-def agents():
+def agents(profile: str | None = None):
     st = _db()
-    rows = st.query("SELECT * FROM agents ORDER BY started_at DESC")
+    where, args = _profile_filter(profile)
+    rows = st.query(
+        "SELECT * FROM agents" + where + " ORDER BY started_at DESC", args)
     now = time.time()
     for r in rows:
         r["toolsets"] = st.jload(r["toolsets"])
@@ -111,9 +138,17 @@ def chats():
 
 
 @router.get("/automations")
-def automations():
+def automations(profile: str | None = None):
     st = _db()
-    return {"automations": st.query("SELECT * FROM automations")}
+    where, args = _profile_filter(profile)
+    rows = st.query("SELECT * FROM automations" + where, args)
+    now = time.time()
+    for r in rows:  # next_run_at calcolato, mai persistito qui
+        try:
+            r["next_run_at"] = _engine.next_run_at(r, now)
+        except Exception:
+            r["next_run_at"] = r.get("next_run")
+    return {"automations": rows}
 
 
 @router.get("/automations/{automation_id}/toggle")
@@ -144,10 +179,14 @@ def files(path: str = "/opt/data/output"):
 
 
 @router.get("/projects")
-def projects():
+def projects(profile: str | None = None):
     st = _db()
-    prows = st.query("SELECT * FROM projects")
-    mrows = st.query("SELECT * FROM missions")
+    where, args = _profile_filter(profile)
+    prows = st.query("SELECT * FROM projects" + where, args)
+    if profile:
+        mrows = st.query("SELECT * FROM missions WHERE profile=?", (profile,))
+    else:
+        mrows = st.query("SELECT * FROM missions")
     for m in mrows:
         m["agent_ids"] = st.jload(m["agent_ids"])
     for pr in prows:
@@ -277,11 +316,59 @@ def automation_detail(automation_id: str):
     summary = (f"L'automazione '{a['name']}' ({a['source']}) si attiva "
                f"con schedulazione '{a['schedule_raw']}', è {stato} "
                f"e l'ultima esecuzione risulta: {esito}.")
-    return {"id": a["id"], "name": a["name"], "source": a["source"],
-            "trigger": a["trigger"], "schedule_raw": a["schedule_raw"],
-            "enabled": bool(a["enabled"]),
-            "composition": {"type": ctype, "steps": steps, "files": files},
-            "summary_italian": summary}
+    out = {"id": a["id"], "name": a["name"], "source": a["source"],
+           "trigger": a["trigger"], "schedule_raw": a["schedule_raw"],
+           "enabled": bool(a["enabled"]),
+           "composition": {"type": ctype, "steps": steps, "files": files},
+           "summary_italian": summary}
+    # Campi engine quando presenti (unica fonte: tabella automations)
+    if a.get("command") or a.get("script_path"):
+        try:
+            out["next_run_at"] = _engine.next_run_at(a)
+        except Exception:
+            out["next_run_at"] = a.get("next_run")
+        out.update({
+            "schedule_kind": a.get("schedule_kind", ""),
+            "schedule_expr": a.get("schedule_expr", ""),
+            "script_path": a.get("script_path", ""),
+            "command": a.get("command", ""),
+            "last_run_at": a.get("last_run_ts"),
+            "last_run_status": a.get("last_run_status", ""),
+            "last_run_output_path": a.get("last_run_output_path", ""),
+            "migration_note": a.get("migration_note", ""),
+            "profile": a.get("profile", "default"),
+        })
+        if a.get("command"):
+            out["composition"] = {
+                "type": "single",
+                "steps": [{"kind": "script",
+                           "path_or_name": a.get("script_path") or a["command"],
+                           "description": "eseguito dall'Automation Engine (subprocess con timeout)"}],
+                "files": [a["script_path"]] if a.get("script_path") else [],
+            }
+    return out
+
+
+@router.post("/automations/{automation_id}/run-now")
+def automation_run_now(automation_id: str):
+    """Esecuzione immediata ad hoc di un'automazione engine."""
+    st = _db()
+    if not st.query("SELECT id FROM automations WHERE id=?", (automation_id,)):
+        raise HTTPException(status_code=404, detail="automation not found")
+    try:
+        return _engine.run_job(automation_id)
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/automations/{automation_id}/logs")
+def automation_logs(automation_id: str, tail: int = 60):
+    """Ultimo output dell'automazione (file in engine-logs/)."""
+    _db()
+    try:
+        return _engine.read_log_tail(automation_id, tail=tail)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="automation not found")
 
 
 # --- Tasks (paperclip-style board) --------------------------------------------
@@ -304,9 +391,10 @@ def _task_enrich(t: dict) -> dict:
 
 
 @router.get("/tasks")
-def tasks_list():
+def tasks_list(profile: str | None = None):
     _db()
-    rows = state.query("SELECT * FROM tasks ORDER BY created_at")
+    where, args = _profile_filter(profile)
+    rows = state.query("SELECT * FROM tasks" + where + " ORDER BY created_at", args)
     return {"tasks": [_task_enrich(t) for t in rows]}
 
 
@@ -335,12 +423,13 @@ def task_create(payload: dict):
         raise HTTPException(status_code=400, detail="parent not found")
     now = time.time()
     tid = payload.get("id") or f"t-{uuid.uuid4().hex[:8]}"
+    profile = (payload.get("profile") or "default").strip() or "default"
     state.execute("INSERT INTO tasks (id,title,description,status,parent_id,assignee_agent_id,"
-                  "assignee_office_id,priority,project_id,created_at,updated_at)"
-                  " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                  "assignee_office_id,priority,project_id,created_at,updated_at,profile)"
+                  " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                   (tid, title, payload.get("description", ""), status, parent,
                    payload.get("assignee_agent_id", ""), payload.get("assignee_office_id", ""),
-                   payload.get("priority", "p2"), payload.get("project_id", ""), now, now))
+                   payload.get("priority", "p2"), payload.get("project_id", ""), now, now, profile))
     return _task_enrich(_task_row(tid))
 
 

@@ -3,11 +3,12 @@
   "label": "Gestionale",
   "description": "Uffici, agenti, chat, automazioni, output e progetti del Gestionale Hermes.",
   "icon": "organization",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "tab": {
     "path": "/gestionale",
     "position": "end",
-    "hidden": true
+    "hidden": false
   },
-  "api": "plugin_api.py"
+  "api": "plugin_api.py",
+  "entry": "dist/index.js"
 }

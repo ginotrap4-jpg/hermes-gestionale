@@ -1,0 +1,5 @@
+name: gestionale
+version: 0.2.0
+description: "Gestionale Hermes — uffici, agenti, chat, automazioni, output e progetti. Backend su /api/plugins/gestionale/, UI nel desktop plugin unificato."
+author: Hermes
+kind: backend

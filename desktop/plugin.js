@@ -1,4 +1,4 @@
-/** Gestionale Hermes — desktop plugin v0.5.5 (device-pixel snap anti-sgrana).
+/** Gestionale Hermes — desktop plugin v0.5.6 (device-pixel snap + persistenza posizioni + push-out iterativo).
  * Sidebar /gestionale con tab: Uffici (top row Orchestratore + Knowledge Keeper,
  * worker force-directed con card rettangolari, glifi, mini-task, elbow lines),
  * Chat, Automazioni (last_run_at + Esegui ora + Log), Output (file explorer),
@@ -360,7 +360,16 @@ function msgTs(m) {
  */
 function useWorkerLayout(ids, edges, expandedIds, activeIds) {
   const posRef = useRef(null)
-  if (!posRef.current) posRef.current = new Map()
+  if (!posRef.current) {
+    // v0.5.6: lo store posizioni sopravvive al remount (store a livello
+    // modulo, chiave per area): un click che rimonta il tab non resetta piu
+    // la geometria a centro-canva (sovrapposizioni/comportamento strano).
+    try {
+      const WK = '__gest_pos_GLOBAL' // chiave unica: niente store multipli per idsKey
+      posRef.current = (typeof window !== 'undefined' && window[WK]) || new Map()
+      if (typeof window !== 'undefined') window[WK] = posRef.current
+    } catch (e) { posRef.current = new Map() }
+  }
   const cardEls = useRef({})
   const wireEls = useRef({})
   const areaEl = useRef(null)
@@ -409,20 +418,25 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
       const m = posRef.current
       ;(ids || []).forEach((id, i) => {
         if (!m.has(id)) {
-          m.set(id, {
-            x: 10 + 80 * (((i + 1) * 0.61803) % 1),
-            y: 28 + 58 * (((i + 1) * 0.38197) % 1),
-            vx: 0, vy: 0,
-          })
+          // v0.5.6: ripristino da localStorage (sopravvive a remount/HMR):
+          let saved = null
+          try {
+            const raw = localStorage.getItem('gest-pos-' + id)
+            if (raw) saved = JSON.parse(raw)
+          } catch (e2) { saved = null }
+          m.set(id, saved && typeof saved.x === 'number'
+            ? { x: saved.x, y: saved.y, vx: 0, vy: 0 }
+            : {
+                x: 10 + 80 * (((i + 1) * 0.61803) % 1),
+                y: 28 + 58 * (((i + 1) * 0.38197) % 1),
+                vx: 0, vy: 0,
+              })
         }
         if (!cardSize.current[id]) cardSize.current[id] = isExp(id) ? { w: 420, h: 420 } : { w: 250, h: 170 }
       })
-      Array.from(m.keys()).forEach((k) => {
-        if ((ids || []).indexOf(k) < 0) {
-          m.delete(k)
-          try { delete cardSize.current[k]; delete frozenUntilRef.current[k]; delete suppressRef.current[k] } catch (e) { /* noop */ }
-        }
-      })
+      // v0.5.6: MAI cancellare nodi (nemmeno dopo remount con ids in volo):
+      //_office uscito = posizione tenuta in memoria, rientra dov'era.
+
     } catch (e) { /* init mai fatale */ }
   }
   function halfOf(id) {
@@ -463,6 +477,7 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
   function applyToDom() {
     // UNICA scrittura DOM: translate3d snap ai device-pixel + fili elbow in px 1:1
     const s = areaSize.current || { w: 800, h: 500 }
+    try { if (window.__GEST_DEBUG__) { const sp0 = {}; posRef.current.forEach((P, id) => { sp0[id] = { x: +P.x.toFixed(1), y: +P.y.toFixed(1) } }); window.__GEST_DEBUG__.pos = sp0; window.__GEST_DEBUG__.snapSize = s } } catch (e) { /* noop */ }
     try {
       posRef.current.forEach((P, id) => {
         const el = cardEls.current[id]
@@ -566,52 +581,60 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
         ids.push(id)
       })
     } catch (e) { return 0 }
-    let pairs = 0
+    let pairs_total = 0
     const disp = []
-    for (let i = 0; i < ids.length; i++) {
-      for (let j = i + 1; j < ids.length; j++) {
-        const a = ids[i]
-        const b = ids[j]
-        const A = m.get(a)
-        const B = m.get(b)
-        if (!A || !B) continue
-        const sa = halfOf(a)
-        const sb = halfOf(b)
-        const ox = (sa.hw + sb.hw) - Math.abs(A.x - B.x)
-        const oy = (sa.hh + sb.hh) - Math.abs(A.y - B.y)
-        if (ox <= 0 || oy <= 0) continue
-        const aF = isFixed(a)
-        const bF = isFixed(b)
-        if (aF && bF) continue
-        if (ox < oy) {
-          const sgn = (A.x >= B.x ? 1 : -1) || 1
-          let sh = 0
-          if (!aF && !bF) { sh = ox / 2 + 0.3; A.x += sgn * sh; B.x -= sgn * sh }
-          else if (!aF) { sh = ox + 0.4; A.x += sgn * sh }
-          else { sh = ox + 0.4; B.x -= sgn * sh }
-          A.x = Math.min(97, Math.max(1, A.x))
-          B.x = Math.min(97, Math.max(1, B.x))
-          A.y = Math.min(97, Math.max(1, A.y))
-          B.y = Math.min(97, Math.max(1, B.y))
-          pairs++
-          if (disp.length < 12) disp.push(a + (aF ? '(f)' : '') + '<->' + b + (bF ? '(f)' : '') + ':dx' + sh.toFixed(2))
-        } else {
-          const sgn = (A.y >= B.y ? 1 : -1) || 1
-          let sh = 0
-          if (!aF && !bF) { sh = oy / 2 + 0.3; A.y += sgn * sh; B.y -= sgn * sh }
-          else if (!aF) { sh = oy + 0.4; A.y += sgn * sh }
-          else { sh = oy + 0.4; B.y -= sgn * sh }
-          A.x = Math.min(97, Math.max(1, A.x))
-          B.x = Math.min(97, Math.max(1, B.x))
-          A.y = Math.min(97, Math.max(1, A.y))
-          B.y = Math.min(97, Math.max(1, B.y))
-          pairs++
-          if (disp.length < 12) disp.push(a + (aF ? '(f)' : '') + '<->' + b + (bF ? '(f)' : '') + ':dy' + sh.toFixed(2))
+    // v0.5.6 ITERATIVO: passate ripetute fino a zero-overlap (max 24) — niente più
+    // residui a metà, "tutte sovrapposte" irrimediabili non possono generarsi.
+    for (let round = 0; round < 24; round++) {
+      let done = true
+      for (let i = 0; i < ids.length; i++) {
+        for (let j = i + 1; j < ids.length; j++) {
+          const a = ids[i]
+          const b = ids[j]
+          const A = m.get(a)
+          const B = m.get(b)
+          if (!A || !B) continue
+          const sa = halfOf(a)
+          const sb = halfOf(b)
+          const ox = (sa.hw + sb.hw) - Math.abs(A.x - B.x)
+          const oy = (sa.hh + sb.hh) - Math.abs(A.y - B.y)
+          if (ox <= 0 || oy <= 0) continue
+          done = false
+          const aF = isFixed(a)
+          const bF = isFixed(b)
+          if (aF && bF) continue
+          if (ox < oy) {
+            const sgn = (A.x >= B.x ? 1 : -1) || 1
+            let sh = 0
+            if (!aF && !bF) { sh = ox / 2 + 0.3; A.x += sgn * sh; B.x -= sgn * sh }
+            else if (!aF) { sh = ox + 0.4; A.x += sgn * sh }
+            else { sh = ox + 0.4; B.x -= sgn * sh }
+            A.x = Math.min(97, Math.max(1, A.x))
+            B.x = Math.min(97, Math.max(1, B.x))
+            A.y = Math.min(97, Math.max(1, A.y))
+            B.y = Math.min(97, Math.max(1, B.y))
+            pairs_total++
+            if (disp.length < 12 && round < 3) disp.push(a + (aF ? '(f)' : '') + '<->' + b + (bF ? '(f)' : '') + ':dx' + sh.toFixed(2))
+          } else {
+            const sgn = (A.y >= B.y ? 1 : -1) || 1
+            let sh = 0
+            if (!aF && !bF) { sh = oy / 2 + 0.3; A.y += sgn * sh; B.y -= sgn * sh }
+            else if (!aF) { sh = oy + 0.4; A.y += sgn * sh }
+            else { sh = oy + 0.4; B.y -= sgn * sh }
+            A.x = Math.min(97, Math.max(1, A.x))
+            B.x = Math.min(97, Math.max(1, B.x))
+            A.y = Math.min(97, Math.max(1, A.y))
+            B.y = Math.min(97, Math.max(1, B.y))
+            pairs_total++
+            if (disp.length < 12 && round < 3) disp.push(a + (aF ? '(f)' : '') + '<->' + b + (bF ? '(f)' : '') + ':dy' + sh.toFixed(2))
+          }
         }
       }
+      if (done) break
     }
-    try { gestLog('overlap-push' + (reason ? ' ' + reason : ''), { pairs, disp, fixed: (typeof fixed === 'string' ? fixed : (fixed ? Object.keys(fixed) : null)) }) } catch (e) { /* noop */ }
-    return pairs
+    try { m.forEach((P) => { if (P) { P.x = devSnap(P.x); P.y = devSnap(P.y) } }) } catch (e) { /* noop */ }
+    try { if (pairs_total) gestLog('overlap-push ' + (reason || ''), { pairs: pairs_total, disp }) } catch (e) { /* noop */ }
+    return pairs_total
   }
   function schedule() {
     if (rafRef.current) return
@@ -805,6 +828,10 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
       } catch (e) { /* niente inerzia: drop secco */ }
       kick({ strong: true, reason: 'drop:' + id }) // loop per l'inerzia, o strong push-out dopo il drop secco (dragged inclusa)
       try {
+        const PP3 = posRef.current.get(id)
+        if (PP3) localStorage.setItem('gest-pos-' + id, JSON.stringify({ x: PP3.x, y: PP3.y }))
+      } catch (e5) { /* noop */ }
+      try {
         const PP2 = posRef.current.get(id)
         gestLog('drag-end', { id, x: PP2 ? +PP2.x.toFixed(2) : null, y: PP2 ? +PP2.y.toFixed(2) : null })
       } catch (e) { /* log mai fatale */ }
@@ -870,7 +897,10 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
   useEffect(() => () => { try { if (rafRef.current) cancelAnimationFrame(rafRef.current) } catch (e) { /* noop */ } }, [])
   const snap = {}
   try { posRef.current.forEach((P, id) => { snap[id] = P }) } catch (e) { /* snapshot best-effort */ }
-  return { pos: snap, cardEls, wireEls, areaEl, areaSize, kick, startDrag, moveDrag, endDrag, consumeSuppress }
+  const __L__ = { pos: snap, posRef, cardEls, wireEls, areaEl, areaSize, kick, startDrag, moveDrag, endDrag, consumeSuppress }
+  const MID = Math.random().toString(36).slice(2, 8)
+  try { if (typeof window !== 'undefined') window.__GEST_LAYOUT__ = { posRef, cardSize, kick, areaSize, mid: MID } } catch (e) { /* noop */ }
+  return __L__
 }
 
 /* Segmento elbow ortogonale in PIXEL interi (spazio 1:1, niente viewBox) ---- */
@@ -1078,6 +1108,7 @@ function UfficiTab(props) {
   const activeIds = wids.filter((id) => stOf(id).active)
   const layout = useWorkerLayout(wids, edges, expandedIds, activeIds)
   const pos = layout.pos
+  const posRefLive = layout.posRef
   const expandedKey = (expandedIds || []).slice().sort().join(',')
   const activeSig = (activeIds || []).slice().sort().join(',')
   const isExpanded = (oid) => (expandedIds || []).indexOf(oid) >= 0
@@ -1191,7 +1222,7 @@ function UfficiTab(props) {
   const renderWorker = (o) => {
     const oid = o.id || o.name
     const st = stOf(oid)
-    const p = (pos && pos[oid]) || { x: 50, y: 60 }
+    const p = (() => { try { const live = posRefLive && posRefLive.current && posRefLive.current.get(oid); if (live) return live } catch (e) { /* noop */ } return (pos && pos[oid]) || { x: 50, y: 60 } })()
     const expanded = isExpanded(oid)
     const ags = st.agents || []
     const shown = expanded ? ags.slice(0, 8) : ags.slice(0, 4)
@@ -2165,7 +2196,7 @@ function GestionalePage() {
         key: 'head', className: 'flex items-center gap-2 px-3 py-2 border-b border-(--ui-stroke-primary)',
         children: [
           jsx('span', { key: 't', className: 'text-sm font-semibold', children: 'Gestionale' }),
-          jsx('span', { key: 'ver', className: 'text-[0.6rem] text-(--ui-text-quaternary)', title: 'versione build plugin', children: 'v0.5.5' }),
+          jsx('span', { key: 'ver', className: 'text-[0.6rem] text-(--ui-text-quaternary)', title: 'versione build plugin', children: 'v0.5.6' }),
           jsx(Badge, { key: 'b', variant: 'secondary', children: running + ' agenti attivi' }),
           jsx('span', { key: 's', className: 'ml-auto text-[0.6rem] text-(--ui-text-quaternary)', children: status }),
         ],

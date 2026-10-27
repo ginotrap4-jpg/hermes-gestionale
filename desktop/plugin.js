@@ -1,4 +1,4 @@
-/** Gestionale Hermes — desktop plugin v0.4.2.
+/** Gestionale Hermes — desktop plugin v0.4.3.
  * Sidebar /gestionale con tab: Uffici (top row Orchestratore + Knowledge Keeper,
  * worker force-directed con card rettangolari, glifi, mini-task, elbow lines),
  * Chat, Automazioni (last_run_at + Esegui ora + Log), Output (file explorer),
@@ -7,6 +7,15 @@
  * fallback a fetch http://127.0.0.1:8790 + polling (3s, 2s per il grafo).
  * Robusto a backend offline (EmptyState). Stile: solo variabili tema,
  * mai colori hardcoded (canvas: toni di blu derivati da --accent).
+ * v0.4.3: (1) NESSUNO scale()/zoom sul contenitore: posizioni snap a px
+ * interi (Math.round), misure via offsetWidth/offsetHeight (non getBoundingRect
+ * su elemento trasformato), SVG in spazio pixel 1:1 (no viewBox stretch) +
+ * non-scaling-stroke, keyframes solo box-shadow (mai scale). (2) card base
+ * 250px / espansa 420px con contenuto completo, reflow anti-overlap multiplo.
+ * (3) motore neutro: uffici inattivi fermi (zero forze, zero confini), solo drag;
+ * zero rAF quando tutti inattivi; worker centrati piu in basso (y~60).
+ * (4) multi-espansione: Set di id espansi, zIndex crescente per card, collapse
+ * solo da header/chiudi, mai da click esterno.
  * v0.4.2: (1) icone ufficiali SDK: officeHead usa <Codicon name> via
  * iconFor() (mapping per ufficio), fallback a glyphFor unicode se Codicon
  * non disponibile; cerchietti restano trasparenti con bordo. (2) sezione
@@ -152,7 +161,7 @@ function monoBlue(i, accent) {
   return 'hsl(' + h + ', 58%, ' + l + '%)'
 }
 
-/* Tab Uffici v0.4.1 ----------------------------------------------------------
+/* Tab Uffici v0.4.3 ----------------------------------------------------------
  * Top row: Orchestratore (sempre presente) + Knowledge Keeper (fissi in alto,
  * non partecipano alle forze). Bottom: worker con layout force-directed SOLO
  * tra loro. Card rettangolari con glifi, agenti in mini-anteprima, mini-task
@@ -209,9 +218,9 @@ function useUfficiStyles() {
   useMemo(() => {
     try {
       if (typeof document === 'undefined') return null
-      if (document.getElementById('uffici-v041-style')) return null
+      if (document.getElementById('uffici-v043-style')) return null
       const st = document.createElement('style')
-      st.id = 'uffici-v041-style'
+      st.id = 'uffici-v043-style'
       st.textContent =
         '@keyframes uffPulse{0%,100%{box-shadow:0 0 0 0 transparent}50%{box-shadow:0 0 10px 0 var(--accent)}}' +
         '@keyframes uffGreenFlash{0%,100%{box-shadow:0 0 0 0 transparent}50%{box-shadow:0 0 12px 0 var(--ui-success,#4cc38a)}}' +
@@ -220,6 +229,8 @@ function useUfficiStyles() {
         '.uff-flash{animation:uffGreenFlash 1.1s ease-in-out infinite}' +
         '.uff-chatline{stroke-dasharray:6 4;animation:uffDash 1.2s linear infinite}' +
         '.uff-card{transition:width .25s ease,border-color .2s ease,box-shadow .2s ease}' +
+        '.uff-card{cursor:grab}' +
+        '.uff-card.uff-drag{cursor:grabbing}' +
         '.uff-pop{box-shadow:0 12px 32px rgba(0,0,0,.30)}' +
         '.uff-agent{cursor:pointer}'
       document.head.appendChild(st)
@@ -249,13 +260,21 @@ function msgTs(m) {
   return t
 }
 
-/* Layout force-directed v0.4.1 in spazio 0..100 (solo worker) ----------------
- * Perf: 1 sola iterazione per frame; rAF attivo SOLO su kick (nuovi nodi, edge
- * live, espansione, resize, cambi reali); early-exit quando |delta|<<0.3;
- * posizioni scritte via refs + translate3d GPU (zero setState per tick);
- * init solo per nuovi nodi (mai ricalcolo completo sui poll); separazione
- * anti-overlap con dimensioni reali misurate dal DOM. */
-function useWorkerLayout(ids, edges, expandedId) {
+/* Layout force-directed v0.4.3 in spazio 0..100 (solo worker) ----------------
+ * (1) NESSUNO scale()/zoom: posizioni scritte come translate3d con px INTERI
+ * (Math.round) + translate(-50%,-50%) su larghezze pari (250/420) -> testo
+ * nitido, niente subpixel blur; misure via offsetWidth/offsetHeight (layout
+ * reale, non trasformato), mai getBoundingClientRect per il reflow.
+ * (2) Motore NEUTRO: uffici inattivi non-espansi = zero forze (no gravita,
+ * repulsione, attrazione edge, confini) e velocita zero; solo drag mouse +
+ * spinta reflow one-shot quando una espansa li copre. Zero rAF quando nessun
+ * ufficio e effettivamente attivo (pose statiche, solo applyToDom).
+ * (3) Worker centrati piu in BASSO (gravita y~60, init y 28..86) per lasciare
+ * aria in alto verso la top row. (4) Drag su tutte le card con deadzone
+ * 5px base / 10px espansa; oltre la deadzone il click viene soppresso.
+ * (5) SVG in spazio PIXEL 1:1 (niente viewBox stretch): path elbow in px
+ * interi + vector-effect non-scaling-stroke, nessuna rasterizzazione. */
+function useWorkerLayout(ids, edges, expandedIds, activeIds) {
   const posRef = useRef({})
   const cardEls = useRef({})
   const wireEls = useRef({})
@@ -263,29 +282,57 @@ function useWorkerLayout(ids, edges, expandedId) {
   const areaSize = useRef({ w: 800, h: 500 })
   const edgesRef = useRef(edges || [])
   edgesRef.current = edges || []
-  const expandedRef = useRef(expandedId)
-  expandedRef.current = expandedId
+  const expSet = {}
+  ;(expandedIds || []).forEach((id) => { expSet[id] = true })
+  const expandedRef = useRef(expSet)
+  expandedRef.current = expSet
+  const actSet = {}
+  ;(activeIds || []).forEach((id) => { actSet[id] = true })
+  const activeRef = useRef(actSet)
+  activeRef.current = actSet
   const rafRef = useRef(0)
   const framesRef = useRef(0)
+  const dragRef = useRef(null)
+  const suppressRef = useRef({})
   const [, setStruct] = useState(0)
   const idsKey = (ids || []).join(',')
+  function isExp(id) { try { return !!expandedRef.current[id] } catch (e) { return false } }
+  function isAct(id) { try { return !!activeRef.current[id] } catch (e) { return false } }
+  function effActive(id) { return isAct(id) || isExp(id) }
+  function hasEffActive() {
+    try {
+      const list = ids || []
+      for (let k = 0; k < list.length; k++) { if (effActive(list[k])) return true }
+      return false
+    } catch (e) { return false }
+  }
   function kick() {
+    if (dragRef.current) return // drag scrive diretto, niente rAF concorrente
     framesRef.current = 0
+    if (!hasEffActive()) {
+      try { resolveOverlapOnce(); applyToDom() } catch (e) { /* pose statiche */ }
+      return // ZERO rAF quando tutti inattivi
+    }
     if (!rafRef.current && typeof requestAnimationFrame !== 'undefined') {
       try { rafRef.current = requestAnimationFrame(frame) } catch (e) { rafRef.current = 0 }
     }
   }
   function sizeOf(id) {
     const s = areaSize.current || { w: 800, h: 500 }
-    let w = expandedRef.current === id ? 300 : 190
-    let h = expandedRef.current === id ? 300 : 150
+    let w = isExp(id) ? 420 : 250
+    let h = isExp(id) ? 380 : 170
     try {
       const el = cardEls.current[id]
       if (el) {
-        const r = el.getBoundingClientRect()
-        if (r && r.width > 20 && s.w > 50) { w = r.width; h = r.height }
+        const ow = el.offsetWidth || 0
+        const oh = el.offsetHeight || 0
+        if (ow > 20 && s.w > 50) { w = ow; h = oh || h }
+        else {
+          const r = el.getBoundingClientRect()
+          if (r && r.width > 20 && s.w > 50) { w = r.width; h = r.height }
+        }
       }
-    } catch (e) { /* misura best-effort */ }
+    } catch (e) { /* misura best-effort su layout reale */ }
     return { hw: ((w / 2 + 16) / s.w) * 100, hh: ((h / 2 + 16) / s.h) * 100 }
   }
   function applyToDom() {
@@ -296,7 +343,9 @@ function useWorkerLayout(ids, edges, expandedId) {
       const P = p[id]
       if (!el || !P) return
       try {
-        el.style.transform = 'translate3d(' + (((P.x / 100) * s.w).toFixed(1)) + 'px,' + (((P.y / 100) * s.h).toFixed(1)) + 'px,0) translate(-50%,-50%)'
+        const X = Math.round((P.x / 100) * s.w)
+        const Y = Math.round((P.y / 100) * s.h)
+        el.style.transform = 'translate3d(' + X + 'px,' + Y + 'px,0) translate(-50%,-50%)'
       } catch (e) { /* dom non pronto */ }
     })
     ;(edgesRef.current || []).forEach((e) => {
@@ -304,32 +353,88 @@ function useWorkerLayout(ids, edges, expandedId) {
       const A = p[e.a]
       const B = p[e.b]
       if (!path || !A || !B) return
-      try { path.setAttribute('d', elbow(A.x, A.y, B.x, B.y)) } catch (e2) { /* noop */ }
+      try {
+        const ax = Math.round((A.x / 100) * s.w)
+        const ay = Math.round((A.y / 100) * s.h)
+        const bx = Math.round((B.x / 100) * s.w)
+        const by = Math.round((B.y / 100) * s.h)
+        path.setAttribute('d', elbowPx(ax, ay, bx, by))
+      } catch (e2) { /* noop */ }
     })
     Object.keys(p).forEach((id) => {
       const path = wireEls.current['a-' + id]
       const P = p[id]
       if (!path || !P) return
-      try { path.setAttribute('d', elbow(P.x, Math.max(0.5, P.y - 6), 50, 0.5)) } catch (e2) { /* noop */ }
+      try {
+        const px = Math.round((P.x / 100) * s.w)
+        const py = Math.round((Math.max(1, P.y - 6) / 100) * s.h)
+        const tx = Math.round(s.w / 2)
+        const ty = Math.max(0, Math.round(s.h * 0.005))
+        path.setAttribute('d', elbowPx(px, py, tx, ty))
+      } catch (e2) { /* noop */ }
     })
+  }
+  function resolveOverlapOnce() {
+    const p = posRef.current
+    const list = Object.keys(p)
+    let i, j
+    for (i = 0; i < list.length; i++) {
+      for (j = i + 1; j < list.length; j++) {
+        const Aid = list[i]
+        const Bid = list[j]
+        const A = p[Aid]
+        const B = p[Bid]
+        if (!A || !B) continue
+        const ea = effActive(Aid)
+        const eb = effActive(Bid)
+        if (!ea && !eb) continue // entrambi fermi: nessuna forza
+        const sa = sizeOf(Aid)
+        const sb = sizeOf(Bid)
+        const ox = (sa.hw + sb.hw) - Math.abs(A.x - B.x)
+        const oy = (sa.hh + sb.hh) - Math.abs(A.y - B.y)
+        if (ox > 0 && oy > 0) {
+          if (ox < oy) {
+            const sgn = (A.x >= B.x ? 1 : -1) || 1
+            const sh = Math.min(ox / 2 + 0.4, 6)
+            if (ea && eb) { A.x += sgn * sh; B.x -= sgn * sh }
+            else if (ea) { A.x += sgn * sh * 2 }
+            else { B.x -= sgn * sh * 2 }
+          } else {
+            const sgn = (A.y >= B.y ? 1 : -1) || 1
+            const sh = Math.min(oy / 2 + 0.4, 6)
+            if (ea && eb) { A.y += sgn * sh; B.y -= sgn * sh }
+            else if (ea) { A.y += sgn * sh * 2 }
+            else { B.y -= sgn * sh * 2 }
+          }
+          try { A.vx = 0; A.vy = 0; B.vx = 0; B.vy = 0 } catch (e) { /* noop */ }
+        }
+      }
+    }
   }
   function frame() {
     rafRef.current = 0
+    if (dragRef.current) return // drag in corso: nessun tick concorrente
     const p = posRef.current
     const list = Object.keys(p)
     if (!list.length) return
     if (++framesRef.current > 600) return // guardia anti-loop
+    if (!hasEffActive()) { try { applyToDom() } catch (e) { /* noop */ } return } // pose statiche
     const edgeList = edgesRef.current || []
     const linked = {}
     edgeList.forEach((e) => { linked[e.a + '|' + e.b] = e; linked[e.b + '|' + e.a] = e })
     let i, j
     for (i = 0; i < list.length; i++) {
-      const A = p[list[i]]
+      const Aid = list[i]
+      if (!effActive(Aid)) continue
+      const A = p[Aid]
       if (!A) continue
       for (j = i + 1; j < list.length; j++) {
-        const B = p[list[j]]
+        const Bid = list[j]
+        if (!effActive(Bid) && !effActive(Aid)) continue
+        const B = p[Bid]
         if (!B) continue
-        const e = linked[list[i] + '|' + list[j]]
+        const bothEff = effActive(Aid) && effActive(Bid)
+        const e = linked[Aid + '|' + Bid]
         let dx = A.x - B.x
         let dy = A.y - B.y
         let d2 = dx * dx + dy * dy
@@ -339,10 +444,13 @@ function useWorkerLayout(ids, edges, expandedId) {
         const f = Math.min(4, rep / d2)
         const ux = (dx / d) * f
         const uy = (dy / d) * f
-        A.vx += ux; A.vy += uy; B.vx -= ux; B.vy -= uy
+        if (bothEff) { A.vx += ux; A.vy += uy; B.vx -= ux; B.vy -= uy }
+        else if (effActive(Aid)) { A.vx += ux; A.vy += uy }
+        else { B.vx -= ux; B.vy -= uy }
       }
     }
     edgeList.forEach((e) => {
+      if (!effActive(e.a) || !effActive(e.b)) return // edge solo tra effettivi
       const A = p[e.a]
       const B = p[e.b]
       if (!A || !B) return
@@ -360,11 +468,16 @@ function useWorkerLayout(ids, edges, expandedId) {
     let pushed = false
     for (i = 0; i < list.length; i++) {
       for (j = i + 1; j < list.length; j++) {
-        const A = p[list[i]]
-        const B = p[list[j]]
+        const Aid = list[i]
+        const Bid = list[j]
+        const A = p[Aid]
+        const B = p[Bid]
         if (!A || !B) continue
-        const sa = sizeOf(list[i])
-        const sb = sizeOf(list[j])
+        const ea = effActive(Aid)
+        const eb = effActive(Bid)
+        if (!ea && !eb) continue
+        const sa = sizeOf(Aid)
+        const sb = sizeOf(Bid)
         const ox = (sa.hw + sb.hw) - Math.abs(A.x - B.x)
         const oy = (sa.hh + sb.hh) - Math.abs(A.y - B.y)
         if (ox > 0 && oy > 0) {
@@ -372,13 +485,15 @@ function useWorkerLayout(ids, edges, expandedId) {
           if (ox < oy) {
             const sgn = (A.x >= B.x ? 1 : -1) || 1
             const sh = Math.min(ox / 2 + 0.4, 6)
-            A.x += sgn * sh; B.x -= sgn * sh
-            A.vx *= 0.6; B.vx *= 0.6
+            if (ea && eb) { A.x += sgn * sh; B.x -= sgn * sh; A.vx *= 0.6; B.vx *= 0.6 }
+            else if (ea) { A.x += sgn * sh * 2; A.vx *= 0.6 }
+            else { B.x -= sgn * sh * 2; B.vx *= 0.6 }
           } else {
             const sgn = (A.y >= B.y ? 1 : -1) || 1
             const sh = Math.min(oy / 2 + 0.4, 6)
-            A.y += sgn * sh; B.y -= sgn * sh
-            A.vy *= 0.6; B.vy *= 0.6
+            if (ea && eb) { A.y += sgn * sh; B.y -= sgn * sh; A.vy *= 0.6; B.vy *= 0.6 }
+            else if (ea) { A.y += sgn * sh * 2; A.vy *= 0.6 }
+            else { B.y -= sgn * sh * 2; B.vy *= 0.6 }
           }
         }
       }
@@ -387,23 +502,85 @@ function useWorkerLayout(ids, edges, expandedId) {
     list.forEach((id) => {
       const P = p[id]
       if (!P) return
+      if (!effActive(id)) { P.vx = 0; P.vy = 0; return } // fermi: niente gravita/confini
       P.vx += (50 - P.x) * 0.004
-      P.vy += (52 - P.y) * 0.004
+      P.vy += (60 - P.y) * 0.004 // centro piu in basso: aria verso la top row
       P.vx *= 0.88; P.vy *= 0.88
       const nx = Math.min(94, Math.max(4, P.x + P.vx))
-      const ny = Math.min(90, Math.max(8, P.y + P.vy))
+      const ny = Math.min(93, Math.max(14, P.y + P.vy))
       const dd = Math.max(Math.abs(nx - P.x), Math.abs(ny - P.y))
       if (dd > maxD) maxD = dd
       P.x = nx; P.y = ny
     })
     applyToDom()
-    if (pushed || maxD > 0.08) rafRef.current = requestAnimationFrame(frame) // fermo quando |delta|<<0.3
+    if (pushed || maxD > 0.08) {
+      try { rafRef.current = requestAnimationFrame(frame) } catch (e) { rafRef.current = 0 }
+    }
+  }
+  function startDrag(id, ev) {
+    try {
+      if (ev && ev.button !== undefined && ev.button !== 0) return
+      const P = posRef.current[id]
+      const s = areaSize.current || { w: 800, h: 500 }
+      if (!P || !s.w) return
+      const sx = (ev && ev.clientX !== undefined) ? ev.clientX : 0
+      const sy = (ev && ev.clientY !== undefined) ? ev.clientY : 0
+      const dead = isExp(id) ? 10 : 5
+      dragRef.current = { id, sx, sy, ox: P.x, oy: P.y, dead, moved: false }
+      try {
+        if (ev && ev.currentTarget && ev.currentTarget.classList) ev.currentTarget.classList.add('uff-drag')
+      } catch (e) { /* noop */ }
+      const onMove = (me) => {
+        try {
+          const dr = dragRef.current
+          if (!dr || dr.id !== id) return
+          const dxPx = (me.clientX || 0) - dr.sx
+          const dyPx = (me.clientY || 0) - dr.sy
+          const dist = Math.sqrt(dxPx * dxPx + dyPx * dyPx)
+          if (!dr.moved && dist < dr.dead) return // deadzone: ancora click
+          dr.moved = true
+          const Q = posRef.current[id]
+          if (!Q) return
+          Q.x = Math.min(97, Math.max(1, dr.ox + (dxPx / s.w) * 100))
+          Q.y = Math.min(97, Math.max(1, dr.oy + (dyPx / s.h) * 100))
+          Q.vx = 0; Q.vy = 0
+          suppressRef.current[id] = Date.now()
+          applyToDom()
+          if (me.preventDefault) me.preventDefault()
+        } catch (e) { /* drag best-effort */ }
+      }
+      const onUp = () => {
+        try {
+          const dr = dragRef.current
+          const wasMoved = !!(dr && dr.moved)
+          dragRef.current = null
+          try {
+            if (ev && ev.currentTarget && ev.currentTarget.classList) ev.currentTarget.classList.remove('uff-drag')
+          } catch (e2) { /* noop */ }
+          try { window.removeEventListener('mousemove', onMove) } catch (e2) { /* noop */ }
+          try { window.removeEventListener('mouseup', onUp) } catch (e2) { /* noop */ }
+          if (wasMoved) {
+            suppressRef.current[id] = Date.now()
+            kick() // un solo reflow dopo il drop
+          }
+        } catch (e) { /* noop */ }
+      }
+      try { window.addEventListener('mousemove', onMove) } catch (e) { /* noop */ }
+      try { window.addEventListener('mouseup', onUp) } catch (e) { /* noop */ }
+    } catch (e) { /* drag mai fatale */ }
+  }
+  function consumeSuppress(id) {
+    try {
+      const t = suppressRef.current[id] || 0
+      if (Date.now() - t < 350) { suppressRef.current[id] = 0; return true }
+      return false
+    } catch (e) { return false }
   }
   useEffect(() => {
     const pr = posRef.current
     ;(ids || []).forEach((id, i) => {
       if (!pr[id]) {
-        pr[id] = { x: 10 + 80 * (((i + 1) * 0.61803) % 1), y: 16 + 68 * (((i + 1) * 0.38197) % 1), vx: 0, vy: 0 }
+        pr[id] = { x: 10 + 80 * (((i + 1) * 0.61803) % 1), y: 28 + 58 * (((i + 1) * 0.38197) % 1), vx: 0, vy: 0 }
       }
     })
     Object.keys(pr).forEach((k) => { if ((ids || []).indexOf(k) < 0) delete pr[k] })
@@ -429,14 +606,25 @@ function useWorkerLayout(ids, edges, expandedId) {
     return () => { try { if (ro) ro.disconnect() } catch (e) { /* noop */ } }
   }, [])
   useEffect(() => () => { try { if (rafRef.current) cancelAnimationFrame(rafRef.current) } catch (e) { /* noop */ } }, [])
-  return { pos: posRef.current, cardEls, wireEls, areaEl, kick }
+  return { pos: posRef.current, cardEls, wireEls, areaEl, kick, startDrag, consumeSuppress }
 }
 
-/* Segmento elbow ortogonale: solo tratti orizzontali + verticali ----------- */
-function elbow(x1, y1, x2, y2) {
-  const mid = ((y1 + y2) / 2).toFixed(1)
-  return 'M ' + x1.toFixed(1) + ' ' + y1.toFixed(1) + ' V ' + mid + ' H ' + x2.toFixed(1) + ' V ' + y2.toFixed(1)
+/* Segmento elbow ortogonale in PIXEL interi (spazio 1:1, niente viewBox) ---- */
+function elbowPx(x1, y1, x2, y2) {
+  const a = Math.round(x1)
+  const b = Math.round(y1)
+  const c = Math.round(x2)
+  const d = Math.round(y2)
+  const mid = Math.round((b + d) / 2)
+  return 'M ' + a + ' ' + b + ' V ' + mid + ' H ' + c + ' V ' + d
 }
+
+/* Compat: elbow in spazio 0..100 solo per path iniziali pre-misura --------- */
+function elbow(x1, y1, x2, y2) {
+  const s = 8
+  return elbowPx(x1 * s, y1 * (s * 0.625), x2 * s, y2 * (s * 0.625))
+}
+
 
 function officeHead(o, st) {
   const nm = (o && (o.name || o.id)) || ''
@@ -525,7 +713,9 @@ function UfficiTab(props) {
   const orchRaw = (props && props.orchData) || null
   const keeperRaw = (props && props.keeperData) || null
   const profile = (props && props.profile) || 'default'
-  const [selOffice, setSelOffice] = useState(null)
+  const [expandedIds, setExpandedIds] = useState([])
+  const [zMap, setZMap] = useState({})
+  const zCounter = useRef(40)
   const [selAgent, setSelAgent] = useState(null) // {officeId, agentId}
   const [orchOpen, setOrchOpen] = useState(false)
   const [keeperOpen, setKeeperOpen] = useState(false)
@@ -621,24 +811,51 @@ function UfficiTab(props) {
   }, [chats, agentOffice, offices])
 
   const wids = workers.map((w) => w.id || w.name)
-  const layout = useWorkerLayout(wids, edges, selOffice)
+  const activeIds = wids.filter((id) => stOf(id).active)
+  const layout = useWorkerLayout(wids, edges, expandedIds, activeIds)
   const pos = layout.pos
+  const expandedKey = (expandedIds || []).slice().sort().join(',')
+  const activeSig = (activeIds || []).slice().sort().join(',')
+  const isExpanded = (oid) => (expandedIds || []).indexOf(oid) >= 0
+  const toggleExpand = (oid) => {
+    try {
+      const has = (expandedIds || []).indexOf(oid) >= 0
+      if (has) setExpandedIds((prev) => (prev || []).filter((x) => x !== oid))
+      else {
+        setExpandedIds((prev) => [...(prev || []), oid])
+        zCounter.current += 1
+        const z = zCounter.current
+        setZMap((prev) => ({ ...(prev || {}), [oid]: z }))
+        setSelAgent(null)
+      }
+      setTimeout(() => { try { layout.kick() } catch (e) { /* motore non pronto */ } }, 30)
+    } catch (e) { /* toggle mai fatale */ }
+  }
+  const collapse = (oid) => {
+    try {
+      setExpandedIds((prev) => (prev || []).filter((x) => x !== oid))
+      setTimeout(() => { try { layout.kick() } catch (e) { /* noop */ } }, 30)
+    } catch (e) { /* noop */ }
+  }
 
   useEffect(() => {
-    if (!selOffice || (details && details[selOffice])) return undefined
+    const missing = (expandedIds || []).filter((id) => !(details && details[id]))
+    if (!missing.length) return undefined
     let alive = true
-    api('/offices/' + encodeURIComponent(selOffice) + '/detail' + q)
-      .then((d) => { if (alive) setDetails((prev) => ({ ...(prev || {}), [selOffice]: d })) })
-      .catch(() => { if (alive) setDetails((prev) => ({ ...(prev || {}), [selOffice]: { _missing: true } })) })
+    missing.forEach((id) => {
+      api('/offices/' + encodeURIComponent(id) + '/detail' + q)
+        .then((d) => { if (alive) setDetails((prev) => ({ ...(prev || {}), [id]: d })) })
+        .catch(() => { if (alive) setDetails((prev) => ({ ...(prev || {}), [id]: { _missing: true } })) })
+    })
     return () => { alive = false }
-  }, [selOffice, q])
+  }, [expandedKey, q])
 
   /* Firma dati leggera: kick motore solo su cambi reali, mai ricalcolo su poll */
   const edgesSig = (edges || []).map((e) => e.a + '|' + e.b).join(',')
   const dataSig = (agents || []).length + ':' + (chats || []).reduce((n, c) => n + (((c && c.messages) || []).length), 0) + ':' + (((tasksData && tasksData.tasks) || []).length)
   useEffect(() => {
     try { layout.kick() } catch (e) { /* motore non pronto */ }
-  }, [edgesSig, selOffice, dataSig, details])
+  }, [edgesSig, expandedKey, activeSig, dataSig, details])
 
   const openChat = (c, wantOpen) => {
     try {
@@ -672,17 +889,17 @@ function UfficiTab(props) {
     }
   })
 
-  const cardBase = 'uff-card flex flex-col gap-1.5 p-2 cursor-pointer'
+  const cardBase = 'uff-card flex flex-col gap-1.5 p-2 select-none'
 
   const renderWorker = (o) => {
     const oid = o.id || o.name
     const st = stOf(oid)
-    const p = (pos && pos[oid]) || { x: 50, y: 50 }
-    const expanded = selOffice === oid
+    const p = (pos && pos[oid]) || { x: 50, y: 60 }
+    const expanded = isExpanded(oid)
     const ags = st.agents || []
-    const shown = ags.slice(0, 4)
+    const shown = expanded ? ags.slice(0, 8) : ags.slice(0, 4)
     const extra = ags.length - shown.length
-    const tks = (st.tasks || []).filter(isCurrentTask).slice(0, 3)
+    const tks = (st.tasks || []).filter(isCurrentTask).slice(0, expanded ? 6 : 3)
     const borderCol = st.flash
       ? 'var(--ui-success, ' + UFF_GREEN + ')'
       : (st.active ? 'var(--accent, var(--ui-accent))' : 'var(--border, var(--ui-stroke-secondary))')
@@ -690,44 +907,115 @@ function UfficiTab(props) {
     const detMsgs = []
     try {
       ;(st.chats || []).forEach((c) => {
-        ;((c && c.messages) || []).slice(-3).forEach((m) => detMsgs.push({ c, m }))
+        ;((c && c.messages) || []).slice(-5).forEach((m) => detMsgs.push({ c, m }))
       })
     } catch (e) { /* preview chat opzionale */ }
+    const z = expanded ? (zMap[oid] || 40) : 10
+    const wid = expanded ? 420 : 250
+    let X0 = 800
+    let Y0 = 500
+    try {
+      const s = { w: 800, h: 500 }
+      X0 = Math.round((p.x / 100) * s.w)
+      Y0 = Math.round((p.y / 100) * s.h)
+    } catch (e) { /* fallback */ }
     return jsx('div', {
       key: oid,
       ref: (el) => { try { if (el) layout.cardEls.current[oid] = el; else delete layout.cardEls.current[oid] } catch (e) { /* noop */ } },
-      onClick: () => { setSelOffice(expanded ? null : oid); if (!expanded) setSelAgent(null) },
+      onMouseDown: (ev) => { try { layout.startDrag(oid, ev) } catch (e) { /* drag mai fatale */ } },
+      onClick: (ev) => { try { if (layout.consumeSuppress(oid)) { ev.stopPropagation(); return } } catch (e) { /* noop */ } },
       className: cardBase + (st.flash ? ' uff-flash' : (st.active ? ' uff-active' : '')) + ' absolute',
       style: {
         left: 0, top: 0,
-        transform: 'translate3d(' + (((p.x / 100) * 800).toFixed(1)) + 'px,' + (((p.y / 100) * 500).toFixed(1)) + 'px,0) translate(-50%,-50%)',
-        width: expanded ? 300 : 190, maxWidth: 'calc(100% - 16px)', zIndex: expanded ? 40 : 10,
+        transform: 'translate3d(' + X0 + 'px,' + Y0 + 'px,0) translate(-50%,-50%)',
+        width: wid, maxWidth: 'calc(100% - 16px)', zIndex: z,
+        maxHeight: expanded ? 480 : undefined, overflow: expanded ? 'auto' : 'visible',
         background: 'var(--card)', opacity: 1, color: 'var(--foreground, var(--ui-text-primary))',
         border: '1px solid ' + (expanded ? 'var(--accent, var(--ui-accent))' : borderCol), borderRadius: 10,
-        boxShadow: expanded ? '0 10px 30px rgba(0,0,0,.30)' : 'none',
-        willChange: 'transform',
+        boxShadow: expanded ? '0 14px 36px rgba(0,0,0,.32)' : 'none',
+        cursor: 'grab',
       },
       children: [
-        officeHead(o, st),
+        jsx('div', {
+          key: 'hh', className: 'flex items-center gap-1.5 cursor-pointer',
+          onClick: (ev) => {
+            try { if (layout.consumeSuppress(oid)) return } catch (e) { /* noop */ }
+            ev.stopPropagation()
+            toggleExpand(oid)
+          },
+          children: [
+            officeHead(o, st),
+            expanded ? jsx('span', { key: 'zx', className: 'ml-auto text-[0.6rem] text-(--ui-text-quaternary)', children: '— riduci' }) : null,
+          ],
+        }),
         shown.length
-          ? jsxs('div', { key: 'ag', className: 'flex flex-col gap-0.5', children: shown.map((a) => agentMini(a, (picked) => setSelAgent({ officeId: oid, agentId: picked.id || picked.name }))) })
+          ? (expanded
+            ? jsxs('div', {
+              key: 'ag', className: 'flex flex-col gap-1',
+              children: shown.map((a) => {
+                const m = (a && typeof a === 'object') ? a : {}
+                const rawFull = m.activity || m.goal || m.current_task || m.task || m.last_output || m.output || 'in attesa di mansione'
+                return jsxs('button', {
+                  key: m.id || m.name, type: 'button', title: 'Apri sessione agente',
+                  onClick: (ev) => { ev.stopPropagation(); setSelAgent({ officeId: oid, agentId: m.id || m.name }) },
+                  className: 'uff-agent w-full text-left rounded-md px-1.5 py-1 hover:bg-(--chrome-action-hover) transition-colors flex flex-col gap-px',
+                  children: [
+                    jsxs('div', {
+                      key: 'r', className: 'flex items-baseline gap-1.5',
+                      children: [
+                        jsx('span', { key: 'n', className: 'text-[0.72rem] font-medium truncate', children: m.name || m.id || '—' }),
+                        m.model || m.llm || m.engine ? jsx('span', { key: 'mo', className: 'ml-auto text-[0.6rem] text-(--ui-text-quaternary) truncate shrink-0', children: String(m.model || m.llm || m.engine).slice(0, 24) }) : null,
+                      ],
+                    }),
+                    jsx('div', { key: 'p', className: 'text-[0.65rem] text-(--ui-text-tertiary) leading-snug break-words', children: String(rawFull || '').slice(0, 220) }),
+                  ],
+                })
+              }),
+            })
+            : jsxs('div', { key: 'ag', className: 'flex flex-col gap-0.5', children: shown.map((a) => agentMini(a, (picked) => setSelAgent({ officeId: oid, agentId: picked.id || picked.name }))) }))
           : jsx('div', { key: 'na', className: 'text-[0.65rem] text-(--ui-text-quaternary)', children: 'Nessun agente attivo' }),
         extra > 0 ? jsx('div', { key: 'more', className: 'text-[0.62rem] text-(--ui-text-quaternary)', children: '+' + extra + ' altri' }) : null,
         tks.length
-          ? jsxs('div', { key: 'tk', className: 'flex flex-col gap-1', children: tks.map((t) => taskMini(t)) })
+          ? (expanded
+            ? jsxs('div', {
+              key: 'tk', className: 'flex flex-col gap-1',
+              children: tks.map((t) => {
+                const m = (t && typeof t === 'object') ? t : {}
+                const color = m.color || 'var(--accent, var(--ui-accent))'
+                const desc = m.description || m.preview || m.status || ''
+                return jsxs('div', {
+                  key: m.id || m.title, className: 'rounded px-1.5 py-1 border border-(--ui-stroke-secondary)',
+                  style: { borderLeft: '3px solid ' + color },
+                  children: [
+                    jsx('div', { key: 't', className: 'text-[0.68rem] font-medium leading-snug break-words', children: m.title || m.id || '—' }),
+                    desc ? jsx('div', { key: 'p', className: 'text-[0.65rem] text-(--ui-text-tertiary) leading-snug break-words', children: String(desc).slice(0, 300) }) : null,
+                  ],
+                })
+              }),
+            })
+            : jsxs('div', { key: 'tk', className: 'flex flex-col gap-1', children: tks.map((t) => taskMini(t)) }))
           : jsx('div', { key: 'ntk', className: 'text-[0.65rem] text-(--ui-text-quaternary)', children: '— Task: niente in esecuzione ora' }),
         expanded ? jsxs('div', {
           key: 'x', className: 'flex flex-col gap-1.5 pt-1 border-t border-(--ui-stroke-secondary)',
           onClick: (ev) => ev.stopPropagation(),
+          onMouseDown: (ev) => ev.stopPropagation(),
           children: [
-            det && !det._missing && det.goal ? jsx('div', { key: 'g', className: 'text-[0.68rem] text-(--ui-text-secondary) leading-snug', children: String(det.goal).slice(0, 200) }) : null,
+            jsxs('div', {
+              key: 'xh', className: 'flex items-center gap-1.5',
+              children: [
+                jsx('span', { key: 't', className: 'text-[0.62rem] uppercase tracking-wide text-(--ui-text-quaternary) flex-1', children: 'Dettaglio ufficio' }),
+                jsx(Button, { key: 'c', size: 'sm', variant: 'ghost', type: 'button', onClick: () => collapse(oid), children: 'Chiudi' }),
+              ],
+            }),
+            det && !det._missing && det.goal ? jsx('div', { key: 'g', className: 'text-[0.68rem] text-(--ui-text-secondary) leading-snug break-words', children: String(det.goal).slice(0, 500) }) : null,
             jsxs('div', {
               key: 'ch', className: 'flex flex-col gap-1',
               children: [
                 jsx('div', { key: 't', className: 'text-[0.62rem] uppercase tracking-wide text-(--ui-text-quaternary)', children: 'Chat collegate' }),
                 (st.chats || []).length
-                  ? (st.chats || []).slice(0, 4).map((c) => jsxs('div', {
+                  ? (st.chats || []).slice(0, 6).map((c) => jsxs('div', {
                     key: (c && c.id) || (c && c.name), className: 'flex items-center gap-1.5',
+                    onMouseDown: (ev) => ev.stopPropagation(),
                     children: [
                       jsx('span', { key: 'n', className: 'text-[0.68rem] truncate flex-1', children: (c && c.name) || (c && c.id) || '—' }),
                       jsx('span', { key: 'c', className: 'text-[0.6rem] text-(--ui-text-quaternary)', children: '' + ((c && c.messages) || []).length }),
@@ -745,10 +1033,10 @@ function UfficiTab(props) {
               key: 'th', className: 'flex flex-col gap-1 rounded-md border border-(--ui-stroke-secondary) p-1.5',
               children: [
                 jsx('div', { key: 't', className: 'text-[0.62rem] uppercase tracking-wide text-(--ui-text-quaternary)', children: 'Attività interna' }),
-                ...detMsgs.slice(-3).map((r, i) => jsxs('div', {
+                ...detMsgs.slice(-5).map((r, i) => jsxs('div', {
                   key: 'm' + i, children: [
                     jsx('div', { key: 'w', className: 'text-[0.6rem] text-(--ui-text-quaternary)', children: agentByIdSafe(agents, r.m) }),
-                    jsx('div', { key: 'x', className: 'text-[0.68rem] text-(--ui-text-secondary)', children: String((r.m && r.m.text) || '').slice(0, 120) }),
+                    jsx('div', { key: 'x', className: 'text-[0.68rem] text-(--ui-text-secondary) leading-snug break-words', children: String((r.m && r.m.text) || '').slice(0, 220) }),
                   ],
                 })),
               ],
@@ -759,7 +1047,8 @@ function UfficiTab(props) {
     })
   }
 
-  /* Popover sessione agente v0.4.1 (click-only, ancorato alla card) ---------- */
+
+  /* Popover sessione agente v0.4.3 (click-only, ancorato alla card) ---------- */
   const popAgent = selAgent ? (stOf(selAgent.officeId).agents || []).find((a) => a && ((a.id || a.name) === selAgent.agentId)) || null : null
   const popDet = (selAgent && details && details[selAgent.officeId]) || null
   const popDetAgents = (popDet && (popDet.agents || popDet.sessions)) || []
@@ -803,7 +1092,7 @@ function UfficiTab(props) {
     update()
     const t = setTimeout(update, 250)
     return () => { alive = false; clearTimeout(t) }
-  }, [selAgent, selOffice, dataSig])
+  }, [selAgent, expandedKey, dataSig])
   const popBase = popXY || ((selAgent && pos && pos[selAgent.officeId]) ? pos[selAgent.officeId] : null)
   const popAnchor = popBase
     ? { x: Math.min(86, popBase.x + 14), y: Math.min(76, popBase.y + 16) }
@@ -894,7 +1183,7 @@ function UfficiTab(props) {
         children: [
           jsx('svg', {
             key: 'wires', className: 'absolute inset-0 w-full h-full pointer-events-none',
-            viewBox: '0 0 100 100', preserveAspectRatio: 'none',
+            shapeRendering: 'crispEdges',
             children: [
               ...(workers || []).filter((w) => (((stOf(w.id || w.name)).agents) || []).length > 0).map((w) => {
                 const p = (pos && pos[w.id || w.name]) || null
@@ -902,8 +1191,8 @@ function UfficiTab(props) {
                 return jsx('path', {
                   key: 'a-' + (w.id || w.name),
                   ref: (el) => { try { if (el) layout.wireEls.current['a-' + (w.id || w.name)] = el } catch (e) { /* noop */ } },
-                  d: elbow(p.x, Math.max(0.5, p.y - 6), 50, 0.5),
-                  fill: 'none', stroke: 'var(--border, var(--ui-stroke-secondary))', strokeWidth: 1.5,
+                  d: elbowPx(Math.round((p.x / 100) * 800), Math.round((Math.max(1, p.y - 6) / 100) * 500), 400, 2),
+                  fill: 'none', stroke: 'var(--border, var(--ui-stroke-secondary))', strokeWidth: 1,
                   vectorEffect: 'non-scaling-stroke', opacity: 0.55,
                 })
               }),
@@ -914,14 +1203,14 @@ function UfficiTab(props) {
                 return jsx('path', {
                   key: e.key,
                   ref: (el) => { try { if (el) layout.wireEls.current[e.key] = el } catch (er) { /* noop */ } },
-                  d: elbow(A.x, A.y, B.x, B.y), fill: 'none',
-                  className: 'uff-chatline', stroke: 'var(--ui-success, ' + UFF_GREEN + ')',
-                  strokeWidth: 1.8, vectorEffect: 'non-scaling-stroke', opacity: 0.9,
+                  d: elbowPx(Math.round((A.x / 100) * 800), Math.round((A.y / 100) * 500), Math.round((B.x / 100) * 800), Math.round((B.y / 100) * 500)),
+                  fill: 'none', className: 'uff-chatline', stroke: 'var(--ui-success, ' + UFF_GREEN + ')',
+                  strokeWidth: 2, vectorEffect: 'non-scaling-stroke', opacity: 0.9,
                 })
               }),
               (popAnchor && popCard) ? jsx('path', {
-                key: 'pop', d: elbow(popCard.x, popCard.y, popAnchor.x, popAnchor.y), fill: 'none',
-                stroke: 'var(--border, var(--ui-stroke-secondary))', strokeWidth: 1.2,
+                key: 'pop', d: elbowPx(Math.round((popCard.x / 100) * 800), Math.round((popCard.y / 100) * 500), Math.round((popAnchor.x / 100) * 800), Math.round((popAnchor.y / 100) * 500)), fill: 'none',
+                stroke: 'var(--border, var(--ui-stroke-secondary))', strokeWidth: 1,
                 vectorEffect: 'non-scaling-stroke', opacity: 0.7,
               }) : null,
             ],
@@ -942,7 +1231,7 @@ function UfficiTab(props) {
             onClick: (ev) => ev.stopPropagation(),
             style: {
               left: popAnchor.x + '%', top: popAnchor.y + '%', transform: 'translate(-50%,-50%)',
-              width: 250, maxWidth: 'calc(100% - 16px)', zIndex: 50, background: 'var(--card)', opacity: 1, borderRadius: 10,
+              width: 280, maxWidth: 'calc(100% - 16px)', zIndex: 60, background: 'var(--card)', opacity: 1, borderRadius: 10,
               border: '1px solid var(--accent, var(--ui-accent))',
             },
             children: [

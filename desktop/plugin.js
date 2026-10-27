@@ -1,4 +1,4 @@
-/** Gestionale Hermes — desktop plugin v0.5.2.
+/** Gestionale Hermes — desktop plugin v0.5.3.
  * Sidebar /gestionale con tab: Uffici (top row Orchestratore + Knowledge Keeper,
  * worker force-directed con card rettangolari, glifi, mini-task, elbow lines),
  * Chat, Automazioni (last_run_at + Esegui ora + Log), Output (file explorer),
@@ -13,6 +13,13 @@
  * sola passata tra nodi fermi non-espansi cap 6px/8px soglia 2px; misure in
  * cache + ResizeObserver; espansa con transition 180ms, frozen 200ms,
  * resta draggable; niente drag da input/textarea/select/contenteditable).
+ * v0.5.3: fix expand al click (drag perfetto preservato). Root cause v0.5.2:
+ * setPointerCapture al pointerdown retargettava il click sulla card, percio
+ * l'onClick dell'header non fireva mai e l'onClick della card non chiamava
+ * toggleExpand. Ora: NIENTE capture al pointerdown (e mai preventDefault),
+ * capture SOLO oltre la deadzone 4px in moveDrag; onClick della card chiama
+ * toggleExpand se consumeSuppress non ha visto drag; log 'card-click' e
+ * 'drag-started' nel gest-debug; fallback window pointerup/pointercancel.
  * v0.5.2: (1) anti-overlap CON expanded (size finali 420x420 vs 250x170):
  * expand = strong push-out a passata singola che ancora la card espansa e
  * sposta i vicini FUORI; drop dopo drag = strong push-out inclusa la
@@ -673,10 +680,20 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
         ox: P.x, oy: P.y, moved: false,
         hist: [{ x: (ev && ev.clientX) || 0, y: (ev && ev.clientY) || 0, t: now }],
       }
+      /* v0.5.3: NIENTE setPointerCapture qui e NIENTE preventDefault —
+       * la capture al pointerdown retargetta il click sulla card e
+       * l'onClick dell'header non firebbe mai (root cause v0.5.2: drag
+       * ok ma expand morto). Capture SOLO oltre la deadzone (moveDrag). */
       try {
-        const node = (ev && ev.currentTarget) || cardEls.current[id]
-        if (node && node.setPointerCapture && ev && ev.pointerId !== undefined) node.setPointerCapture(ev.pointerId)
-      } catch (e) { /* capture opzionale */ }
+        // Fallback: pointerup fuori dalla card senza capture — chiude
+        // comunque il drag (best-effort, una sola volta).
+        if (typeof window !== 'undefined' && ev && ev.pointerId !== undefined) {
+          const pid = ev.pointerId
+          const fin = (e2) => { try { if (e2 && e2.pointerId !== pid) return; endDrag(id, e2) } catch (e3) { /* noop */ } }
+          window.addEventListener('pointerup', fin, { once: true })
+          window.addEventListener('pointercancel', fin, { once: true })
+        }
+      } catch (e) { /* fallback opzionale */ }
       try {
         const el = cardEls.current[id]
         if (el && el.classList) el.classList.add('uff-drag')
@@ -695,7 +712,18 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
       const dxPx = (ev.clientX || 0) - dr.sx
       const dyPx = (ev.clientY || 0) - dr.sy
       if (!dr.moved && Math.sqrt(dxPx * dxPx + dyPx * dyPx) < 4) return // deadzone: ancora click
-      dr.moved = true
+      if (!dr.moved) {
+        // v0.5.3: drag VERO (oltre deadzone) — capture solo ora, cosi il
+        // click puro non viene retargettato e l'onClick resta vivo.
+        dr.moved = true
+        try {
+          const capEl = cardEls.current[id]
+          if (capEl && capEl.setPointerCapture && ev && ev.pointerId !== undefined) {
+            try { capEl.setPointerCapture(ev.pointerId) } catch (e2) { /* pointer gia rilasciato */ }
+          }
+        } catch (e) { /* capture opzionale */ }
+        try { gestLog('drag-started', { id }) } catch (e) { /* log mai fatale */ }
+      }
       try {
         const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()
         dr.hist.push({ x: ev.clientX || 0, y: ev.clientY || 0, t: now })
@@ -1178,7 +1206,14 @@ function UfficiTab(props) {
       onPointerMove: (ev) => { try { layout.moveDrag(oid, ev) } catch (e) { /* drag mai fatale */ } },
       onPointerUp: (ev) => { try { layout.endDrag(oid, ev) } catch (e) { /* drag mai fatale */ } },
       onPointerCancel: (ev) => { try { layout.endDrag(oid, ev) } catch (e) { /* drag mai fatale */ } },
-      onClick: (ev) => { try { if (layout.consumeSuppress(oid)) { ev.stopPropagation(); return } } catch (e) { /* noop */ } },
+      onClick: (ev) => {
+        // v0.5.3: il click sulla card espande/collassa — SOLO se non c'e
+        // stato drag in questa sessione (suppress 350ms da endDrag).
+        // L'header fa gia stopPropagation + toggle: niente doppio toggle.
+        try { gestLog('card-click', { id: oid }) } catch (e) { /* log mai fatale */ }
+        try { if (layout.consumeSuppress(oid)) { ev.stopPropagation(); return } } catch (e) { /* noop */ }
+        toggleExpand(oid)
+      },
       className: cardBase + (st.flash ? ' uff-flash' : (st.active ? ' uff-active' : '')) + ' absolute',
       style: {
         left: 0, top: 0,

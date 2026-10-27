@@ -1219,6 +1219,15 @@ function UfficiTab(props) {
 
   const cardBase = 'uff-card flex flex-col gap-1.5 p-2 select-none'
 
+  // v0.5.7: snap ai pixel fisici anche per il writer JSX del transform
+  const devSnapUI = (v) => {
+    try {
+      const d = (typeof window !== 'undefined' && window.devicePixelRatio) || 1
+      if (!d || d === 1) return Math.round(v)
+      return Math.round(v * d) / d
+    } catch (e) { return Math.round(v) }
+  }
+
   const renderWorker = (o) => {
     const oid = o.id || o.name
     const st = stOf(oid)
@@ -1240,15 +1249,15 @@ function UfficiTab(props) {
     } catch (e) { /* preview chat opzionale */ }
     const z = expanded ? (zMap[oid] || 40) : 10
     const wid = expanded ? 420 : 250
-    let X0 = 800
-    let Y0 = 500
+    let X0 = devSnapUI(800)
+    let Y0 = devSnapUI(500)
     try {
       // FIX v0.5.1: stessa area misurata di applyToDom (mai 800x500 fissi),
       // altrimenti ogni re-render (poll 2s) sovrascrive il translate3d del
       // drag con coordinate sbagliate = vibrazione/lotta col mouse.
       const ar = (layout.areaSize && layout.areaSize.current) || { w: 800, h: 500 }
-      X0 = Math.round((p.x / 100) * (ar.w || 800))
-      Y0 = Math.round((p.y / 100) * (ar.h || 500))
+      X0 = devSnapUI((p.x / 100) * (ar.w || 800))
+      Y0 = devSnapUI((p.y / 100) * (ar.h || 500))
     } catch (e) { /* fallback */ }
     return jsx('div', {
       key: oid,
@@ -2196,7 +2205,7 @@ function GestionalePage() {
         key: 'head', className: 'flex items-center gap-2 px-3 py-2 border-b border-(--ui-stroke-primary)',
         children: [
           jsx('span', { key: 't', className: 'text-sm font-semibold', children: 'Gestionale' }),
-          jsx('span', { key: 'ver', className: 'text-[0.6rem] text-(--ui-text-quaternary)', title: 'versione build plugin', children: 'v0.5.6' }),
+          jsx('span', { key: 'ver', className: 'text-[0.6rem] text-(--ui-text-quaternary)', title: 'versione build plugin', children: 'v0.5.7' }),
           jsx(Badge, { key: 'b', variant: 'secondary', children: running + ' agenti attivi' }),
           jsx('span', { key: 's', className: 'ml-auto text-[0.6rem] text-(--ui-text-quaternary)', children: status }),
         ],

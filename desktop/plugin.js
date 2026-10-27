@@ -1,4 +1,4 @@
-/** Gestionale Hermes — desktop plugin v0.4.
+/** Gestionale Hermes — desktop plugin v0.4.1.
  * Sidebar /gestionale con tab: Uffici (top row Orchestratore + Knowledge Keeper,
  * worker force-directed con card rettangolari, glifi, mini-task, elbow lines),
  * Chat, Automazioni (last_run_at + Esegui ora + Log), Output (file explorer),
@@ -7,6 +7,13 @@
  * fallback a fetch http://127.0.0.1:8790 + polling (3s, 2s per il grafo).
  * Robusto a backend offline (EmptyState). Stile: solo variabili tema,
  * mai colori hardcoded (canvas: toni di blu derivati da --accent).
+ * v0.4.1: (1) zero collegamenti fantasma — linee solo se chat live <5min o
+ * flag backend, mai fallback tenue; stub orchestratore solo se agenti presenti.
+ * (2) card espansa opaca + shadow + anti-overlap con misure DOM (adiacenti si
+ * spostano), focus singolo. (3) engine: 1 iter/frame, rAF solo su kick,
+ * early-exit, translate3d GPU via refs, niente setState per tick. (4) popover
+ * sessione click-only ancorato alla card: nome, modello, activity (ultima
+ * riga), task corrente, ultime righe output.
  */
 import { cn, host, Button, Badge, EmptyState, StatusDot, Tip } from '@hermes/plugin-sdk'
 import { ROUTES_AREA, SIDEBAR_NAV_AREA, PALETTE_AREA } from '@hermes/plugin-sdk'
@@ -139,13 +146,14 @@ function monoBlue(i, accent) {
   return 'hsl(' + h + ', 58%, ' + l + '%)'
 }
 
-/* Tab Uffici v0.4 ------------------------------------------------------------
+/* Tab Uffici v0.4.1 ----------------------------------------------------------
  * Top row: Orchestratore (sempre presente) + Knowledge Keeper (fissi in alto,
  * non partecipano alle forze). Bottom: worker con layout force-directed SOLO
  * tra loro. Card rettangolari con glifi, agenti in mini-anteprima, mini-task
- * colorati, linee elbow ortogonali, pulse attive, flash verde su chat interna,
- * expand in place, popover sessione agente. Fallback sicuri se campi/API
- * mancano: la UI resta grafica anche con dati vuoti.
+ * colorati, linee elbow ortogonali, pulse azzurre attive, flash verde su chat
+ * interna, expand in place opaco anti-overlap, popover sessione agente.
+ * Linee SOLO per chat vive (<5min o flag backend): zero fallback tenue.
+ * Fallback sicuri se campi/API mancano: la UI resta grafica anche con dati vuoti.
  */
 const UFF_GREEN = '#4cc38a'
 
@@ -170,9 +178,9 @@ function useUfficiStyles() {
   useMemo(() => {
     try {
       if (typeof document === 'undefined') return null
-      if (document.getElementById('uffici-v4-style')) return null
+      if (document.getElementById('uffici-v041-style')) return null
       const st = document.createElement('style')
-      st.id = 'uffici-v4-style'
+      st.id = 'uffici-v041-style'
       st.textContent =
         '@keyframes uffPulse{0%,100%{box-shadow:0 0 0 0 transparent}50%{box-shadow:0 0 10px 0 var(--accent)}}' +
         '@keyframes uffGreenFlash{0%,100%{box-shadow:0 0 0 0 transparent}50%{box-shadow:0 0 12px 0 var(--ui-success,#4cc38a)}}' +
@@ -180,7 +188,9 @@ function useUfficiStyles() {
         '.uff-active{animation:uffPulse 2.4s ease-in-out infinite}' +
         '.uff-flash{animation:uffGreenFlash 1.1s ease-in-out infinite}' +
         '.uff-chatline{stroke-dasharray:6 4;animation:uffDash 1.2s linear infinite}' +
-        '.uff-card{transition:width .25s ease,border-color .2s ease,box-shadow .2s ease}'
+        '.uff-card{transition:width .25s ease,border-color .2s ease,box-shadow .2s ease}' +
+        '.uff-pop{box-shadow:0 12px 32px rgba(0,0,0,.30)}' +
+        '.uff-agent{cursor:pointer}'
       document.head.appendChild(st)
       return null
     } catch (e) { return null }
@@ -208,83 +218,187 @@ function msgTs(m) {
   return t
 }
 
-/* Layout force-directed in spazio normalizzato 0..100 (solo worker) --------- */
-function useWorkerLayout(ids, edges) {
+/* Layout force-directed v0.4.1 in spazio 0..100 (solo worker) ----------------
+ * Perf: 1 sola iterazione per frame; rAF attivo SOLO su kick (nuovi nodi, edge
+ * live, espansione, resize, cambi reali); early-exit quando |delta|<<0.3;
+ * posizioni scritte via refs + translate3d GPU (zero setState per tick);
+ * init solo per nuovi nodi (mai ricalcolo completo sui poll); separazione
+ * anti-overlap con dimensioni reali misurate dal DOM. */
+function useWorkerLayout(ids, edges, expandedId) {
   const posRef = useRef({})
-  const [, setVer] = useState(0)
+  const cardEls = useRef({})
+  const wireEls = useRef({})
+  const areaEl = useRef(null)
+  const areaSize = useRef({ w: 800, h: 500 })
+  const edgesRef = useRef(edges || [])
+  edgesRef.current = edges || []
+  const expandedRef = useRef(expandedId)
+  expandedRef.current = expandedId
+  const rafRef = useRef(0)
+  const framesRef = useRef(0)
+  const [, setStruct] = useState(0)
   const idsKey = (ids || []).join(',')
-  const edgesKey = (edges || []).map((e) => e.a + '|' + e.b + ':' + (e.active ? 1 : 0) + ':' + e.weight).join(',')
-  useEffect(() => {
-    const p = posRef.current
-    ;(ids || []).forEach((id, i) => {
-      if (!p[id]) {
-        p[id] = { x: 10 + 80 * (((i + 1) * 0.61803) % 1), y: 16 + 68 * (((i + 1) * 0.38197) % 1), vx: 0, vy: 0 }
+  function kick() {
+    framesRef.current = 0
+    if (!rafRef.current && typeof requestAnimationFrame !== 'undefined') {
+      try { rafRef.current = requestAnimationFrame(frame) } catch (e) { rafRef.current = 0 }
+    }
+  }
+  function sizeOf(id) {
+    const s = areaSize.current || { w: 800, h: 500 }
+    let w = expandedRef.current === id ? 300 : 190
+    let h = expandedRef.current === id ? 300 : 150
+    try {
+      const el = cardEls.current[id]
+      if (el) {
+        const r = el.getBoundingClientRect()
+        if (r && r.width > 20 && s.w > 50) { w = r.width; h = r.height }
       }
+    } catch (e) { /* misura best-effort */ }
+    return { hw: ((w / 2 + 16) / s.w) * 100, hh: ((h / 2 + 16) / s.h) * 100 }
+  }
+  function applyToDom() {
+    const s = areaSize.current || { w: 800, h: 500 }
+    const p = posRef.current
+    Object.keys(p).forEach((id) => {
+      const el = cardEls.current[id]
+      const P = p[id]
+      if (!el || !P) return
+      try {
+        el.style.transform = 'translate3d(' + (((P.x / 100) * s.w).toFixed(1)) + 'px,' + (((P.y / 100) * s.h).toFixed(1)) + 'px,0) translate(-50%,-50%)'
+      } catch (e) { /* dom non pronto */ }
     })
-    Object.keys(p).forEach((k) => { if ((ids || []).indexOf(k) < 0) delete p[k] })
-  }, [idsKey])
-  useEffect(() => {
-    if (!(ids || []).length) return undefined
-    let alive = true
-    let timer = 0
-    const edgeList = edges || []
+    ;(edgesRef.current || []).forEach((e) => {
+      const path = wireEls.current[e.key]
+      const A = p[e.a]
+      const B = p[e.b]
+      if (!path || !A || !B) return
+      try { path.setAttribute('d', elbow(A.x, A.y, B.x, B.y)) } catch (e2) { /* noop */ }
+    })
+    Object.keys(p).forEach((id) => {
+      const path = wireEls.current['a-' + id]
+      const P = p[id]
+      if (!path || !P) return
+      try { path.setAttribute('d', elbow(P.x, Math.max(0.5, P.y - 6), 50, 0.5)) } catch (e2) { /* noop */ }
+    })
+  }
+  function frame() {
+    rafRef.current = 0
+    const p = posRef.current
+    const list = Object.keys(p)
+    if (!list.length) return
+    if (++framesRef.current > 600) return // guardia anti-loop
+    const edgeList = edgesRef.current || []
     const linked = {}
     edgeList.forEach((e) => { linked[e.a + '|' + e.b] = e; linked[e.b + '|' + e.a] = e })
-    const stepOnce = () => {
-      if (!alive) return
-      const p = posRef.current
-      const list = ids || []
-      for (let i = 0; i < list.length; i++) {
-        const A = p[list[i]]
-        if (!A) continue
-        for (let j = i + 1; j < list.length; j++) {
-          const B = p[list[j]]
-          if (!B) continue
-          const e = linked[list[i] + '|' + list[j]]
-          let dx = A.x - B.x
-          let dy = A.y - B.y
-          let d2 = dx * dx + dy * dy
-          if (d2 < 0.5) { dx = (i - j) || 0.5; dy = (i % 2 ? 1 : -1) * 0.5; d2 = dx * dx + dy * dy }
-          const d = Math.sqrt(d2) || 1
-          const rep = e ? 26 : 90 // non comunicano -> repulsione maggiore, distanza massima
-          const f = Math.min(4, rep / d2)
-          const ux = (dx / d) * f
-          const uy = (dy / d) * f
-          A.vx += ux; A.vy += uy; B.vx -= ux; B.vy -= uy
-        }
-      }
-      edgeList.forEach((e) => {
-        if (!e.active) return // chat closed -> forza rilasciata
-        const A = p[e.a]
-        const B = p[e.b]
-        if (!A || !B) return
-        const w = Math.min(30, Number(e.weight) || 1)
-        const rest = Math.max(14, 44 - w * 1.1)
-        const k = 0.02 * (1 + w * 0.15) // attrazione proporzionale al peso live
-        const dx = B.x - A.x
-        const dy = B.y - A.y
-        const d = Math.sqrt(dx * dx + dy * dy) || 1
-        const f = (d - rest) * k
+    let i, j
+    for (i = 0; i < list.length; i++) {
+      const A = p[list[i]]
+      if (!A) continue
+      for (j = i + 1; j < list.length; j++) {
+        const B = p[list[j]]
+        if (!B) continue
+        const e = linked[list[i] + '|' + list[j]]
+        let dx = A.x - B.x
+        let dy = A.y - B.y
+        let d2 = dx * dx + dy * dy
+        if (d2 < 0.5) { dx = (i - j) || 0.5; dy = (i % 2 ? 1 : -1) * 0.5; d2 = dx * dx + dy * dy }
+        const d = Math.sqrt(d2) || 1
+        const rep = e ? 26 : 90 // non comunicano -> repulsione maggiore
+        const f = Math.min(4, rep / d2)
         const ux = (dx / d) * f
         const uy = (dy / d) * f
         A.vx += ux; A.vy += uy; B.vx -= ux; B.vy -= uy
-      })
-      list.forEach((id) => {
-        const P = p[id]
-        if (!P) return
-        P.vx += (50 - P.x) * 0.004
-        P.vy += (52 - P.y) * 0.004
-        P.vx *= 0.88; P.vy *= 0.88
-        P.x = Math.min(94, Math.max(4, P.x + P.vx))
-        P.y = Math.min(90, Math.max(8, P.y + P.vy))
-      })
-      setVer((v) => v + 1)
-      timer = setTimeout(stepOnce, 90)
+      }
     }
-    timer = setTimeout(stepOnce, 90)
-    return () => { alive = false; clearTimeout(timer) }
-  }, [idsKey, edgesKey])
-  return posRef.current
+    edgeList.forEach((e) => {
+      const A = p[e.a]
+      const B = p[e.b]
+      if (!A || !B) return
+      const w = Math.min(30, Number(e.weight) || 1)
+      const rest = Math.max(14, 44 - w * 1.1)
+      const k = 0.02 * (1 + w * 0.15) // attrazione proporzionale al peso live
+      const dx = B.x - A.x
+      const dy = B.y - A.y
+      const d = Math.sqrt(dx * dx + dy * dy) || 1
+      const f = (d - rest) * k
+      const ux = (dx / d) * f
+      const uy = (dy / d) * f
+      A.vx += ux; A.vy += uy; B.vx -= ux; B.vy -= uy
+    })
+    let pushed = false
+    for (i = 0; i < list.length; i++) {
+      for (j = i + 1; j < list.length; j++) {
+        const A = p[list[i]]
+        const B = p[list[j]]
+        if (!A || !B) continue
+        const sa = sizeOf(list[i])
+        const sb = sizeOf(list[j])
+        const ox = (sa.hw + sb.hw) - Math.abs(A.x - B.x)
+        const oy = (sa.hh + sb.hh) - Math.abs(A.y - B.y)
+        if (ox > 0 && oy > 0) {
+          pushed = true
+          if (ox < oy) {
+            const sgn = (A.x >= B.x ? 1 : -1) || 1
+            const sh = Math.min(ox / 2 + 0.4, 6)
+            A.x += sgn * sh; B.x -= sgn * sh
+            A.vx *= 0.6; B.vx *= 0.6
+          } else {
+            const sgn = (A.y >= B.y ? 1 : -1) || 1
+            const sh = Math.min(oy / 2 + 0.4, 6)
+            A.y += sgn * sh; B.y -= sgn * sh
+            A.vy *= 0.6; B.vy *= 0.6
+          }
+        }
+      }
+    }
+    let maxD = 0
+    list.forEach((id) => {
+      const P = p[id]
+      if (!P) return
+      P.vx += (50 - P.x) * 0.004
+      P.vy += (52 - P.y) * 0.004
+      P.vx *= 0.88; P.vy *= 0.88
+      const nx = Math.min(94, Math.max(4, P.x + P.vx))
+      const ny = Math.min(90, Math.max(8, P.y + P.vy))
+      const dd = Math.max(Math.abs(nx - P.x), Math.abs(ny - P.y))
+      if (dd > maxD) maxD = dd
+      P.x = nx; P.y = ny
+    })
+    applyToDom()
+    if (pushed || maxD > 0.08) rafRef.current = requestAnimationFrame(frame) // fermo quando |delta|<<0.3
+  }
+  useEffect(() => {
+    const pr = posRef.current
+    ;(ids || []).forEach((id, i) => {
+      if (!pr[id]) {
+        pr[id] = { x: 10 + 80 * (((i + 1) * 0.61803) % 1), y: 16 + 68 * (((i + 1) * 0.38197) % 1), vx: 0, vy: 0 }
+      }
+    })
+    Object.keys(pr).forEach((k) => { if ((ids || []).indexOf(k) < 0) delete pr[k] })
+    setStruct((v) => v + 1)
+    kick()
+    return undefined
+  }, [idsKey])
+  useEffect(() => {
+    const el = areaEl.current
+    if (!el || typeof ResizeObserver === 'undefined') return undefined
+    let ro = null
+    try {
+      const measure = () => {
+        try {
+          const r = el.getBoundingClientRect()
+          if (r && r.width > 50) areaSize.current = { w: r.width, h: r.height }
+        } catch (e) { /* noop */ }
+      }
+      measure()
+      ro = new ResizeObserver(() => { measure(); kick() })
+      ro.observe(el)
+    } catch (e) { /* observer non disponibile */ }
+    return () => { try { if (ro) ro.disconnect() } catch (e) { /* noop */ } }
+  }, [])
+  useEffect(() => () => { try { if (rafRef.current) cancelAnimationFrame(rafRef.current) } catch (e) { /* noop */ } }, [])
+  return { pos: posRef.current, cardEls, wireEls, areaEl, kick }
 }
 
 /* Segmento elbow ortogonale: solo tratti orizzontali + verticali ----------- */
@@ -316,12 +430,16 @@ function officeHead(o, st) {
 function agentMini(a, onPick) {
   const m = (a && typeof a === 'object') ? a : {}
   const model = m.model || m.llm || m.engine || ''
-  const firstOut = ((m.last_output || m.output || '').split ? (m.last_output || m.output || '').split('\n')[0] : '')
-  const rawPrev = m.activity || m.goal || m.current_task || m.task || firstOut || 'in attesa di mansione'
+  let lastOut = ''
+  try {
+    const lines = String(m.last_output || m.output || '').split('\n').map((s) => (s || '').trim()).filter(Boolean)
+    if (lines.length) lastOut = lines[lines.length - 1]
+  } catch (e) { lastOut = '' }
+  const rawPrev = m.activity || m.goal || m.current_task || m.task || lastOut || 'in attesa di mansione'
   return jsxs('button', {
-    key: m.id || m.name, type: 'button',
+    key: m.id || m.name, type: 'button', title: 'Apri sessione agente',
     onClick: (ev) => { ev.stopPropagation(); if (onPick) onPick(m) },
-    className: 'w-full text-left rounded-md px-1.5 py-1 hover:bg-(--chrome-action-hover) transition-colors flex flex-col gap-px',
+    className: 'uff-agent w-full text-left rounded-md px-1.5 py-1 hover:bg-(--chrome-action-hover) transition-colors flex flex-col gap-px',
     children: [
       jsxs('div', {
         key: 'r', className: 'flex items-baseline gap-1.5',
@@ -422,6 +540,10 @@ function UfficiTab(props) {
 
   const stOf = (oid) => (info && info[oid]) || { agents: [], tasks: [], chats: [], flash: false, active: false }
 
+  /* Edge v0.4.1 — SOLO connessioni vive, zero collegamenti fantasma --------
+   * Una linea esiste solo se: chat OPEN con ultimo messaggio <5min, oppure
+   * flag live dal backend (chat_active/live/is_active/active). Coppie non
+   * attive = NESSUN path (nemmeno tratteggiato tenue). */
   const edges = useMemo(() => {
     const wids = {}
     workers.forEach((w) => { wids[w.id || w.name] = true })
@@ -442,17 +564,24 @@ function UfficiTab(props) {
       }
     })
     const now = Date.now() / 1000
-    return Object.keys(pairs).map((k, i) => {
+    const out = []
+    Object.keys(pairs).forEach((k, i) => {
       const parts = k.split('|')
       const c = pairChat[k] || {}
       const msgs = (c && c.messages) || []
-      const live = msgs.length ? ((now - msgTs(msgs[msgs.length - 1])) < 120) : false
-      return { a: parts[0], b: parts[1], weight: pairs[k], chatId: (c && c.id) || null, label: (c && c.name) || '', key: 'e' + i, active: live }
+      const lastT = msgs.length ? msgTs(msgs[msgs.length - 1]) : 0
+      const recent = lastT > 0 && (now - lastT) < 300 // ultimo messaggio <5min
+      const closed = Boolean(c && (c.closed === true || c.open === false || c.status === 'closed' || c.state === 'closed'))
+      const backendLive = Boolean(c && (c.chat_active === true || c.live === true || c.is_active === true || c.active === true))
+      if (!((!closed && recent) || backendLive)) return // uffici sconnessi: zero collegamenti
+      out.push({ a: parts[0], b: parts[1], weight: pairs[k], chatId: (c && c.id) || null, label: (c && c.name) || '', key: 'e' + i, active: true })
     })
+    return out
   }, [chats, agentOffice, offices])
 
   const wids = workers.map((w) => w.id || w.name)
-  const pos = useWorkerLayout(wids, edges)
+  const layout = useWorkerLayout(wids, edges, selOffice)
+  const pos = layout.pos
 
   useEffect(() => {
     if (!selOffice || (details && details[selOffice])) return undefined
@@ -462,6 +591,13 @@ function UfficiTab(props) {
       .catch(() => { if (alive) setDetails((prev) => ({ ...(prev || {}), [selOffice]: { _missing: true } })) })
     return () => { alive = false }
   }, [selOffice, q])
+
+  /* Firma dati leggera: kick motore solo su cambi reali, mai ricalcolo su poll */
+  const edgesSig = (edges || []).map((e) => e.a + '|' + e.b).join(',')
+  const dataSig = (agents || []).length + ':' + (chats || []).reduce((n, c) => n + (((c && c.messages) || []).length), 0) + ':' + (((tasksData && tasksData.tasks) || []).length)
+  useEffect(() => {
+    try { layout.kick() } catch (e) { /* motore non pronto */ }
+  }, [edgesSig, selOffice, dataSig, details])
 
   const openChat = (c, wantOpen) => {
     try {
@@ -518,13 +654,17 @@ function UfficiTab(props) {
     } catch (e) { /* preview chat opzionale */ }
     return jsx('div', {
       key: oid,
+      ref: (el) => { try { if (el) layout.cardEls.current[oid] = el; else delete layout.cardEls.current[oid] } catch (e) { /* noop */ } },
       onClick: () => { setSelOffice(expanded ? null : oid); if (!expanded) setSelAgent(null) },
       className: cardBase + (st.flash ? ' uff-flash' : (st.active ? ' uff-active' : '')) + ' absolute',
       style: {
-        left: p.x + '%', top: p.y + '%', transform: 'translate(-50%,-50%)',
-        width: expanded ? 300 : 190, zIndex: expanded ? 20 : 10,
-        background: 'var(--card)', color: 'var(--foreground, var(--ui-text-primary))',
-        border: '1px solid ' + borderCol, borderRadius: 10,
+        left: 0, top: 0,
+        transform: 'translate3d(' + (((p.x / 100) * 800).toFixed(1)) + 'px,' + (((p.y / 100) * 500).toFixed(1)) + 'px,0) translate(-50%,-50%)',
+        width: expanded ? 300 : 190, maxWidth: 'calc(100% - 16px)', zIndex: expanded ? 40 : 10,
+        background: 'var(--card)', opacity: 1, color: 'var(--foreground, var(--ui-text-primary))',
+        border: '1px solid ' + (expanded ? 'var(--accent, var(--ui-accent))' : borderCol), borderRadius: 10,
+        boxShadow: expanded ? '0 10px 30px rgba(0,0,0,.30)' : 'none',
+        willChange: 'transform',
       },
       children: [
         officeHead(o, st),
@@ -576,23 +716,57 @@ function UfficiTab(props) {
     })
   }
 
-  /* Popover sessione agente -------------------------------------------------- */
+  /* Popover sessione agente v0.4.1 (click-only, ancorato alla card) ---------- */
   const popAgent = selAgent ? (stOf(selAgent.officeId).agents || []).find((a) => a && ((a.id || a.name) === selAgent.agentId)) || null : null
   const popDet = (selAgent && details && details[selAgent.officeId]) || null
   const popDetAgents = (popDet && (popDet.agents || popDet.sessions)) || []
   const popDetA = popDetAgents.find((a) => a && ((a.id || a.name) === (selAgent && selAgent.agentId))) || {}
-  const popOut = (popAgent && (popAgent.last_output || popAgent.output))
-    || (popDetA && (popDetA.last_output || popDetA.output))
-    || (((popDetA && popDetA.lines) || []).length ? popDetA.lines.slice(-3).join('\n') : '')
-    || 'nessun output recente'
-  const popTask = (popAgent && (popAgent.current_task || popAgent.task || popAgent.goal))
-    || (popDetA && (popDetA.current_task || popDetA.task))
-    || ''
-  const popAnchor = selAgent && pos && pos[selAgent.officeId]
-    ? { x: Math.min(86, pos[selAgent.officeId].x + 15), y: Math.min(76, pos[selAgent.officeId].y + 14) }
+  function lastLinesOf(v, n) {
+    try {
+      const lines = String(v == null ? '' : v).split('\n').map((s) => (s || '').trim()).filter(Boolean)
+      return lines.slice(-(n || 4))
+    } catch (e) { return [] }
+  }
+  // Activity corrente (/agents): ultima riga utile (output:/thinking: se presenti)
+  const popActLines = lastLinesOf((popAgent && (popAgent.activity || popAgent.last_output || popAgent.output)) || (popDetA && (popDetA.activity || popDetA.last_output || popDetA.output)) || '', 6)
+  const popActivity = popActLines.length ? popActLines[popActLines.length - 1] : ''
+  // Task corrente: match agente su /tasks, fallback active_task_ids ufficio
+  const popAllTasks = ((tasksData && tasksData.tasks) || [])
+  const popAid = (selAgent && selAgent.agentId) || null
+  const popAgentTasks = popAllTasks.filter((t) => t && typeof t === 'object' && popAid && (t.assignee === popAid || t.assignee_id === popAid || t.agent_id === popAid || t.agent === popAid))
+  const popOffice = selAgent ? list.find((o) => o && ((o.id || o.name) === selAgent.officeId)) || null : null
+  const popOfficeTaskIds = (popOffice && (popOffice.active_task_ids || popOffice.task_ids)) || []
+  const popOfficeTasks = popAllTasks.filter((t) => t && popOfficeTaskIds.indexOf(t.id) >= 0)
+  const popTaskRows = (popAgentTasks.length ? popAgentTasks : popOfficeTasks).slice(0, 2)
+  // Ultime righe output: last_output/output, altrimenti 'in attesa di output…'
+  const popOutLines = lastLinesOf((popAgent && (popAgent.last_output || popAgent.output)) || (popDetA && (popDetA.last_output || popDetA.output)) || (popDetA && Array.isArray(popDetA.lines) ? popDetA.lines.join('\n') : '') || '', 4)
+  const popOut = popOutLines.length ? popOutLines.join('\n') : ''
+  // Anchor: segue la card via misura DOM (expand-safe), fallback a pos
+  const [popXY, setPopXY] = useState(null)
+  useEffect(() => {
+    if (!selAgent) { setPopXY(null); return undefined }
+    let alive = true
+    const update = () => {
+      try {
+        const area = layout.areaEl.current
+        const card = layout.cardEls.current[selAgent.officeId]
+        if (!area || !card) return
+        const ar = area.getBoundingClientRect()
+        const cr = card.getBoundingClientRect()
+        if (!ar || !cr || ar.width < 10) return
+        if (alive) setPopXY({ x: ((cr.left - ar.left + cr.width / 2) / ar.width) * 100, y: ((cr.top - ar.top + cr.height / 2) / ar.height) * 100 })
+      } catch (e) { /* best-effort */ }
+    }
+    update()
+    const t = setTimeout(update, 250)
+    return () => { alive = false; clearTimeout(t) }
+  }, [selAgent, selOffice, dataSig])
+  const popBase = popXY || ((selAgent && pos && pos[selAgent.officeId]) ? pos[selAgent.officeId] : null)
+  const popAnchor = popBase
+    ? { x: Math.min(86, popBase.x + 14), y: Math.min(76, popBase.y + 16) }
     : null
-  const popCard = selAgent && pos && pos[selAgent.officeId]
-    ? { x: pos[selAgent.officeId].x, y: pos[selAgent.officeId].y }
+  const popCard = popBase
+    ? { x: popBase.x, y: popBase.y }
     : null
 
   return jsxs('div', {
@@ -673,17 +847,19 @@ function UfficiTab(props) {
       }),
       /* Bottom: worker force-directed ---------------------------------------- */
       jsx('div', {
-        key: 'area', className: 'relative flex-1 min-h-[440px] rounded-md border border-(--ui-stroke-primary)',
+        key: 'area', ref: layout.areaEl, className: 'relative flex-1 min-h-[440px] rounded-md border border-(--ui-stroke-primary)',
         children: [
           jsx('svg', {
             key: 'wires', className: 'absolute inset-0 w-full h-full pointer-events-none',
             viewBox: '0 0 100 100', preserveAspectRatio: 'none',
             children: [
-              ...(workers || []).filter((w) => stOf(w.id || w.name).active).map((w) => {
+              ...(workers || []).filter((w) => (((stOf(w.id || w.name)).agents) || []).length > 0).map((w) => {
                 const p = (pos && pos[w.id || w.name]) || null
                 if (!p) return null
                 return jsx('path', {
-                  key: 'a-' + (w.id || w.name), d: elbow(p.x, Math.max(0.5, p.y - 6), 50, 0.5),
+                  key: 'a-' + (w.id || w.name),
+                  ref: (el) => { try { if (el) layout.wireEls.current['a-' + (w.id || w.name)] = el } catch (e) { /* noop */ } },
+                  d: elbow(p.x, Math.max(0.5, p.y - 6), 50, 0.5),
                   fill: 'none', stroke: 'var(--border, var(--ui-stroke-secondary))', strokeWidth: 1.5,
                   vectorEffect: 'non-scaling-stroke', opacity: 0.55,
                 })
@@ -692,17 +868,12 @@ function UfficiTab(props) {
                 const A = (pos && pos[e.a]) || null
                 const B = (pos && pos[e.b]) || null
                 if (!A || !B) return null
-                if (e.active) {
-                  return jsx('path', {
-                    key: e.key, d: elbow(A.x, A.y, B.x, B.y), fill: 'none',
-                    className: 'uff-chatline', stroke: 'var(--ui-success, ' + UFF_GREEN + ')',
-                    strokeWidth: 1.8, vectorEffect: 'non-scaling-stroke', opacity: 0.9,
-                  })
-                }
                 return jsx('path', {
-                  key: e.key, d: elbow(A.x, A.y, B.x, B.y), fill: 'none',
-                  stroke: 'var(--border, var(--ui-stroke-secondary))', strokeWidth: 1,
-                  vectorEffect: 'non-scaling-stroke', opacity: 0.25,
+                  key: e.key,
+                  ref: (el) => { try { if (el) layout.wireEls.current[e.key] = el } catch (er) { /* noop */ } },
+                  d: elbow(A.x, A.y, B.x, B.y), fill: 'none',
+                  className: 'uff-chatline', stroke: 'var(--ui-success, ' + UFF_GREEN + ')',
+                  strokeWidth: 1.8, vectorEffect: 'non-scaling-stroke', opacity: 0.9,
                 })
               }),
               (popAnchor && popCard) ? jsx('path', {
@@ -717,12 +888,18 @@ function UfficiTab(props) {
             key: 'empty', className: 'absolute inset-0 flex items-center justify-center',
             children: jsx(EmptyState, { label: 'Nessun ufficio worker' }),
           }) : null,
+          (selAgent && popAgent && popAnchor) ? jsx('div', {
+            key: 'popbd', className: 'absolute inset-0',
+            style: { zIndex: 40, background: 'transparent', cursor: 'default' },
+            onClick: () => setSelAgent(null),
+          }) : null,
           (selAgent && popAgent && popAnchor) ? jsxs('div', {
             key: 'pop',
-            className: 'uff-card absolute flex flex-col gap-1 p-2',
+            className: 'uff-card uff-pop absolute flex flex-col gap-1 p-2',
+            onClick: (ev) => ev.stopPropagation(),
             style: {
               left: popAnchor.x + '%', top: popAnchor.y + '%', transform: 'translate(-50%,-50%)',
-              width: 240, zIndex: 30, background: 'var(--card)', borderRadius: 10,
+              width: 250, maxWidth: 'calc(100% - 16px)', zIndex: 50, background: 'var(--card)', opacity: 1, borderRadius: 10,
               border: '1px solid var(--accent, var(--ui-accent))',
             },
             children: [
@@ -734,14 +911,24 @@ function UfficiTab(props) {
                   jsx(Button, { key: 'x', size: 'sm', variant: 'ghost', type: 'button', onClick: () => setSelAgent(null), children: '✕' }),
                 ],
               }),
-              jsx('div', { key: 'mo', className: 'text-[0.6rem] text-(--ui-text-quaternary)', children: (popAgent.model || popAgent.llm || '') + (popAgent.state ? ' · ' + popAgent.state : '') }),
-              jsx('div', { key: 'ac', className: 'text-[0.68rem] text-(--ui-text-secondary) leading-snug', children: String(popAgent.activity || popAgent.goal || 'in attesa di mansione').slice(0, 160) }),
-              popTask ? jsx('div', { key: 'tk', className: 'text-[0.65rem] text-(--ui-text-tertiary)', children: 'Task: ' + String(popTask).slice(0, 120) }) : null,
+              jsx('div', { key: 'mo', className: 'text-[0.6rem] text-(--ui-text-quaternary)', children: ((popAgent.model || popAgent.llm || popAgent.engine) || 'modello n/d') + (popAgent.state ? ' · ' + popAgent.state : '') }),
+              jsx('div', { key: 'acl', className: 'text-[0.6rem] uppercase tracking-wide text-(--ui-text-quaternary)', children: 'Activity corrente' }),
+              jsx('div', { key: 'ac', className: 'text-[0.68rem] text-(--ui-text-secondary) leading-snug break-words', children: String(popActivity || popAgent.goal || 'in attesa di mansione').slice(0, 200) }),
+              popTaskRows.length ? jsxs('div', {
+                key: 'tks', className: 'flex flex-col gap-0.5',
+                children: [
+                  jsx('div', { key: 't', className: 'text-[0.6rem] uppercase tracking-wide text-(--ui-text-quaternary)', children: 'Task corrente' }),
+                  ...popTaskRows.map((t, i) => jsx('div', {
+                    key: 'tk' + i, className: 'text-[0.65rem] text-(--ui-text-tertiary) truncate',
+                    children: '· ' + String((t && (t.title || t.id)) || '—').slice(0, 120) + ((t && (t.status || t.state)) ? ' (' + (t.status || t.state) + ')' : ''),
+                  })),
+                ],
+              }) : null,
               jsxs('div', {
                 key: 'out', className: 'rounded border border-(--ui-stroke-secondary) p-1.5 flex flex-col gap-0.5',
                 children: [
                   jsx('div', { key: 't', className: 'text-[0.6rem] uppercase tracking-wide text-(--ui-text-quaternary)', children: 'Ultime righe output' }),
-                  jsx('pre', { key: 'p', className: 'text-[0.65rem] text-(--ui-text-secondary) whitespace-pre-wrap break-all max-h-28 overflow-auto', children: String(popOut).slice(0, 600) }),
+                  jsx('pre', { key: 'p', className: 'text-[0.65rem] text-(--ui-text-secondary) whitespace-pre-wrap break-all max-h-28 overflow-auto', children: String(popOut || 'in attesa di output…').slice(0, 600) }),
                 ],
               }),
             ],

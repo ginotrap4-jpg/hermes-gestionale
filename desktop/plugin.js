@@ -1,4 +1,4 @@
-/** Gestionale Hermes — desktop plugin v0.4.4.
+/** Gestionale Hermes — desktop plugin v0.5.1.
  * Sidebar /gestionale con tab: Uffici (top row Orchestratore + Knowledge Keeper,
  * worker force-directed con card rettangolari, glifi, mini-task, elbow lines),
  * Chat, Automazioni (last_run_at + Esegui ora + Log), Output (file explorer),
@@ -7,13 +7,12 @@
  * fallback a fetch http://127.0.0.1:8790 + polling (3s, 2s per il grafo).
  * Robusto a backend offline (EmptyState). Stile: solo variabili tema,
  * mai colori hardcoded (canvas: toni di blu derivati da --accent).
- * v0.4.4: (1) drag stabile: card in drag/inerzia esclusa da OGNI fisica e
- * anti-overlap (flag frozenId), mai rAF concorrente che la sposta; (2) inerzia
- * leggera al lancio (velocity media ~80ms, damping 0.82/frame, cutoff
- * ~0.02px/frame, clamp 28px/frame), decelerazione libera senza forze, una sola
- * passata anti-overlap soft dopo il fermo; (3) no-vibra: soglia morta <2px
- * negli spostamenti reflow, il loop si ferma; (4) niente drag se il mousedown
- * e su input/textarea/select/contenteditable o con selezione testo attiva.
+ * v0.5: riscrittura stabile del motore Uffici (single source of truth
+ * Map<id,{x,y,vx,vy}>; drag con pointer capture + scrittura diretta DOM;
+ * UN SOLO rAF solo per inerzia damping 0.92 stop <0.01; anti-overlap una
+ * sola passata tra nodi fermi non-espansi cap 6px/8px soglia 2px; misure in
+ * cache + ResizeObserver; espansa con transition 180ms, frozen 200ms,
+ * resta draggable; niente drag da input/textarea/select/contenteditable).
  * v0.4.3: (1) NESSUNO scale()/zoom sul contenitore: posizioni snap a px
  * interi (Math.round), misure via offsetWidth/offsetHeight (non getBoundingRect
  * su elemento trasformato), SVG in spazio pixel 1:1 (no viewBox stretch) +
@@ -168,7 +167,7 @@ function monoBlue(i, accent) {
   return 'hsl(' + h + ', 58%, ' + l + '%)'
 }
 
-/* Tab Uffici v0.4.3 ----------------------------------------------------------
+/* Tab Uffici v0.5 ----------------------------------------------------------
  * Top row: Orchestratore (sempre presente) + Knowledge Keeper (fissi in alto,
  * non partecipano alle forze). Bottom: worker con layout force-directed SOLO
  * tra loro. Card rettangolari con glifi, agenti in mini-anteprima, mini-task
@@ -225,9 +224,9 @@ function useUfficiStyles() {
   useMemo(() => {
     try {
       if (typeof document === 'undefined') return null
-      if (document.getElementById('uffici-v043-style')) return null
+      if (document.getElementById('uffici-v05-style')) return null
       const st = document.createElement('style')
-      st.id = 'uffici-v043-style'
+      st.id = 'uffici-v05-style'
       st.textContent =
         '@keyframes uffPulse{0%,100%{box-shadow:0 0 0 0 transparent}50%{box-shadow:0 0 10px 0 var(--accent)}}' +
         '@keyframes uffGreenFlash{0%,100%{box-shadow:0 0 0 0 transparent}50%{box-shadow:0 0 12px 0 var(--ui-success,#4cc38a)}}' +
@@ -235,7 +234,8 @@ function useUfficiStyles() {
         '.uff-active{animation:uffPulse 2.4s ease-in-out infinite}' +
         '.uff-flash{animation:uffGreenFlash 1.1s ease-in-out infinite}' +
         '.uff-chatline{stroke-dasharray:6 4;animation:uffDash 1.2s linear infinite}' +
-        '.uff-card{transition:width .25s ease,border-color .2s ease,box-shadow .2s ease}' +
+        '.uff-card{transition:width .18s ease-out,height .18s ease-out,border-color .2s ease,box-shadow .2s ease}' +
+        '.uff-card.uff-drag{transition:none}' +
         '.uff-card{cursor:grab}' +
         '.uff-card.uff-drag{cursor:grabbing}' +
         '.uff-pop{box-shadow:0 12px 32px rgba(0,0,0,.30)}' +
@@ -267,399 +267,334 @@ function msgTs(m) {
   return t
 }
 
-/* Layout force-directed v0.4.4 in spazio 0..100 (solo worker) ----------------
- * (0) DRAG STABILE: card in drag/inerzia esclusa da ogni forza e reflow via
- * frozenId; inerzia post-lancio (damping 0.82, cutoff ~0.02px/frame, clamp);
- * soglia morta <2px nel reflow (niente vibrazione); no-drag su input/selezione.
- * (1) NESSUNO scale()/zoom: posizioni scritte come translate3d con px INTERI
- * (Math.round) + translate(-50%,-50%) su larghezze pari (250/420) -> testo
- * nitido, niente subpixel blur; misure via offsetWidth/offsetHeight (layout
- * reale, non trasformato), mai getBoundingClientRect per il reflow.
- * (2) Motore NEUTRO: uffici inattivi non-espansi = zero forze (no gravita,
- * repulsione, attrazione edge, confini) e velocita zero; solo drag mouse +
- * spinta reflow one-shot quando una espansa li copre. Zero rAF quando nessun
- * ufficio e effettivamente attivo (pose statiche, solo applyToDom).
- * (3) Worker centrati piu in BASSO (gravita y~60, init y 28..86) per lasciare
- * aria in alto verso la top row. (4) Drag su tutte le card con deadzone
- * 5px base / 10px espansa; oltre la deadzone il click viene soppresso.
- * (5) SVG in spazio PIXEL 1:1 (niente viewBox stretch): path elbow in px
- * interi + vector-effect non-scaling-stroke, nessuna rasterizzazione. */
+/* Motore layout/drag v0.5 — riscrittura stabile -----------------------------------
+ * Single source of truth: Map<id,{x,y,vx,vy}> in posRef (unita 0..100).
+ * Drag: pointerdown con setPointerCapture sulla card; pointermove scrive
+ * DIRETTAMENTE translate3d nel DOM + Map (zero re-render, zero fisica sul
+ * nodo dragged). Pointerup: release capture + media mobile delle ultime 3
+ * mosse convertita in inerzia. UN SOLO rAF per tutto: integra solo l'inerzia
+ * (damping exp 0.92, stop sotto |vx|+|vy|<0.01, slide sui confini, mai
+ * getBoundingClientRect nel loop). Anti-overlap: SOLO tra nodi fermi
+ * non-espansi, UNA passata per evento reale (asse minore, meta overlap per
+ * lato, cap 6px/step — 8px post-inerzia — soglia 2px, niente loop).
+ * Misure in cache a mount + ResizeObserver. Card espansa: width/height con
+ * transition 180ms ease-out, frozen 200ms durante la transition, resta
+ * draggable. Niente drag da input/textarea/select/contenteditable o con
+ * selezione testo attiva.
+ */
 function useWorkerLayout(ids, edges, expandedIds, activeIds) {
-  const posRef = useRef({})
+  const posRef = useRef(null)
+  if (!posRef.current) posRef.current = new Map()
   const cardEls = useRef({})
   const wireEls = useRef({})
   const areaEl = useRef(null)
   const areaSize = useRef({ w: 800, h: 500 })
+  const cardSize = useRef({})
+  const rafRef = useRef(0)
+  const iterRef = useRef(0)
+  const dragRef = useRef(null)
+  const frozenUntilRef = useRef({})
+  const suppressRef = useRef({})
   const edgesRef = useRef(edges || [])
   edgesRef.current = edges || []
   const expSet = {}
   ;(expandedIds || []).forEach((id) => { expSet[id] = true })
   const expandedRef = useRef(expSet)
   expandedRef.current = expSet
-  const actSet = {}
-  ;(activeIds || []).forEach((id) => { actSet[id] = true })
-  const activeRef = useRef(actSet)
-  activeRef.current = actSet
-  const rafRef = useRef(0)
-  const framesRef = useRef(0)
-  const dragRef = useRef(null)
-  const inertiaRef = useRef({})
-  const suppressRef = useRef({})
   const [, setStruct] = useState(0)
   const idsKey = (ids || []).join(',')
+  const expandedKey = (expandedIds || []).slice().sort().join(',')
+  const prevExpRef = useRef('__init__')
   function isExp(id) { try { return !!expandedRef.current[id] } catch (e) { return false } }
-  function isAct(id) { try { return !!activeRef.current[id] } catch (e) { return false } }
-  function effActive(id) { return isAct(id) || isExp(id) }
-  function hasEffActive() {
+  function isDragged(id) { try { return !!(dragRef.current && dragRef.current.id === id) } catch (e) { return false } }
+  function hasSpeed(P) { try { return (Math.abs(P.vx) + Math.abs(P.vy)) >= 0.01 } catch (e) { return false } }
+  function hasInertia() {
     try {
-      const list = ids || []
-      for (let k = 0; k < list.length; k++) { if (effActive(list[k])) return true }
-      return false
+      let found = false
+      posRef.current.forEach((P) => { if (hasSpeed(P)) found = true })
+      return found
     } catch (e) { return false }
   }
-  function hasInertia() {
-    try { return Object.keys(inertiaRef.current || {}).length > 0 } catch (e) { return false }
-  }
-  function frozenId(id) {
-    // card in drag o in inerzia: esclusa da OGNI fisica e anti-overlap
+  function eligible(id) {
+    // anti-overlap solo tra nodi fermi non-espansi: mai dragged, mai inerzia, mai frozen
+    if (isExp(id)) return false
+    if (isDragged(id)) return false
     try {
-      if (dragRef.current && dragRef.current.id === id) return true
-      if (inertiaRef.current && inertiaRef.current[id]) return true
-    } catch (e) { /* noop */ }
-    return false
+      const P = posRef.current.get(id)
+      if (P && hasSpeed(P)) return false
+      if (Date.now() < (frozenUntilRef.current[id] || 0)) return false
+    } catch (e) { return false }
+    return true
   }
-  function kick() {
-    framesRef.current = 0
-    if (!hasEffActive() && !hasInertia()) {
-      try { resolveOverlapOnce(false); applyToDom() } catch (e) { /* pose statiche */ }
-      return // ZERO rAF quando tutti inattivi e niente inerzia
-    }
-    if (!rafRef.current && typeof requestAnimationFrame !== 'undefined') {
-      try { rafRef.current = requestAnimationFrame(frame) } catch (e) { rafRef.current = 0 }
-    }
+  function ensureNodes() {
+    try {
+      const m = posRef.current
+      ;(ids || []).forEach((id, i) => {
+        if (!m.has(id)) {
+          m.set(id, {
+            x: 10 + 80 * (((i + 1) * 0.61803) % 1),
+            y: 28 + 58 * (((i + 1) * 0.38197) % 1),
+            vx: 0, vy: 0,
+          })
+        }
+        if (!cardSize.current[id]) cardSize.current[id] = isExp(id) ? { w: 420, h: 380 } : { w: 250, h: 170 }
+      })
+      Array.from(m.keys()).forEach((k) => {
+        if ((ids || []).indexOf(k) < 0) {
+          m.delete(k)
+          try { delete cardSize.current[k]; delete frozenUntilRef.current[k]; delete suppressRef.current[k] } catch (e) { /* noop */ }
+        }
+      })
+    } catch (e) { /* init mai fatale */ }
   }
-  function sizeOf(id) {
+  function halfOf(id) {
+    // semi-dimensioni in unita 0..100 dalla cache (mai misurate nel loop)
     const s = areaSize.current || { w: 800, h: 500 }
-    let w = isExp(id) ? 420 : 250
-    let h = isExp(id) ? 380 : 170
+    let c = null
+    try { c = cardSize.current[id] || null } catch (e) { c = null }
+    if (!c) c = isExp(id) ? { w: 420, h: 380 } : { w: 250, h: 170 }
+    return { hw: (((c.w || 250) / 2 + 16) / (s.w || 800)) * 100, hh: (((c.h || 170) / 2 + 16) / (s.h || 500)) * 100 }
+  }
+  function syncCardSizes() {
+    // UNA misura per evento reale (kick), MAI dentro il rAF loop.
+    // MAI misurare card in transition (espanse o frozen 200ms): la width
+    // animata darebbe valori intermedi che spostano i vicini a ripetizione.
+    // Per quelle vale il target finale (base 250 / espansa 420).
     try {
-      const el = cardEls.current[id]
-      if (el) {
+      const nowMs = Date.now()
+      Object.keys(cardEls.current || {}).forEach((id) => {
+        if (isExp(id)) { cardSize.current[id] = { w: 420, h: 380 }; return }
+        if (nowMs < (frozenUntilRef.current[id] || 0)) return
+        let el = null
+        try { el = cardEls.current[id] } catch (e) { el = null }
+        if (!el) return
         const ow = el.offsetWidth || 0
         const oh = el.offsetHeight || 0
-        if (ow > 20 && s.w > 50) { w = ow; h = oh || h }
-        else {
-          const r = el.getBoundingClientRect()
-          if (r && r.width > 20 && s.w > 50) { w = r.width; h = r.height }
-        }
-      }
-    } catch (e) { /* misura best-effort su layout reale */ }
-    return { hw: ((w / 2 + 16) / s.w) * 100, hh: ((h / 2 + 16) / s.h) * 100 }
+        if (ow > 20 && oh > 20) cardSize.current[id] = { w: ow, h: oh }
+      })
+    } catch (e) { /* misura best-effort */ }
   }
   function applyToDom() {
+    // UNICA scrittura DOM: translate3d a px interi + fili elbow in px 1:1
     const s = areaSize.current || { w: 800, h: 500 }
-    const p = posRef.current
-    Object.keys(p).forEach((id) => {
-      const el = cardEls.current[id]
-      const P = p[id]
-      if (!el || !P) return
-      try {
+    try {
+      posRef.current.forEach((P, id) => {
+        const el = cardEls.current[id]
+        if (!el || !P) return
         const X = Math.round((P.x / 100) * s.w)
         const Y = Math.round((P.y / 100) * s.h)
         el.style.transform = 'translate3d(' + X + 'px,' + Y + 'px,0) translate(-50%,-50%)'
-      } catch (e) { /* dom non pronto */ }
-    })
-    ;(edgesRef.current || []).forEach((e) => {
-      const path = wireEls.current[e.key]
-      const A = p[e.a]
-      const B = p[e.b]
-      if (!path || !A || !B) return
-      try {
+      })
+    } catch (e) { /* dom non pronto */ }
+    try {
+      ;(edgesRef.current || []).forEach((e) => {
+        const path = wireEls.current[e.key]
+        const A = posRef.current.get(e.a)
+        const B = posRef.current.get(e.b)
+        if (!path || !A || !B) return
         const ax = Math.round((A.x / 100) * s.w)
         const ay = Math.round((A.y / 100) * s.h)
         const bx = Math.round((B.x / 100) * s.w)
         const by = Math.round((B.y / 100) * s.h)
         path.setAttribute('d', elbowPx(ax, ay, bx, by))
-      } catch (e2) { /* noop */ }
-    })
-    Object.keys(p).forEach((id) => {
-      const path = wireEls.current['a-' + id]
-      const P = p[id]
-      if (!path || !P) return
-      try {
+      })
+    } catch (e2) { /* fili opzionali */ }
+    try {
+      posRef.current.forEach((P, id) => {
+        const path = wireEls.current['a-' + id]
+        if (!path || !P) return
         const px = Math.round((P.x / 100) * s.w)
         const py = Math.round((Math.max(1, P.y - 6) / 100) * s.h)
         const tx = Math.round(s.w / 2)
         const ty = Math.max(0, Math.round(s.h * 0.005))
         path.setAttribute('d', elbowPx(px, py, tx, ty))
-      } catch (e2) { /* noop */ }
-    })
+      })
+    } catch (e3) { /* ancore opzionali */ }
   }
-  function resolveOverlapOnce(soft) {
-    const p = posRef.current
-    const list = Object.keys(p)
+  function resolveOverlapOnce(afterInertia) {
+    // UNA sola passata, niente loop: meta overlap per lato sull'asse minore.
+    // Cap 6px/step (8px post-inerzia), soglia 2px: sotto soglia niente tocchi.
+    const m = posRef.current
     const s = areaSize.current || { w: 800, h: 500 }
-    const cap = soft ? 1.5 : 6 // passata soft post-inerzia: spostamento leggero
-    let i, j
-    for (i = 0; i < list.length; i++) {
-      for (j = i + 1; j < list.length; j++) {
-        const Aid = list[i]
-        const Bid = list[j]
-        const A = p[Aid]
-        const B = p[Bid]
+    const capPx = afterInertia ? 8 : 6
+    const list = []
+    try {
+      m.forEach((P, id) => { if (eligible(id)) list.push(id) })
+    } catch (e) { return }
+    for (let i = 0; i < list.length; i++) {
+      for (let j = i + 1; j < list.length; j++) {
+        const A = m.get(list[i])
+        const B = m.get(list[j])
         if (!A || !B) continue
-        if (frozenId(Aid) || frozenId(Bid)) continue // drag/inerzia: mai toccare
-        const ea = effActive(Aid)
-        const eb = effActive(Bid)
-        if (!ea && !eb) continue // entrambi fermi: nessuna forza
-        const sa = sizeOf(Aid)
-        const sb = sizeOf(Bid)
+        const sa = halfOf(list[i])
+        const sb = halfOf(list[j])
         const ox = (sa.hw + sb.hw) - Math.abs(A.x - B.x)
         const oy = (sa.hh + sb.hh) - Math.abs(A.y - B.y)
-        if (ox > 0 && oy > 0) {
-          if (ox < oy) {
-            const sgn = (A.x >= B.x ? 1 : -1) || 1
-            const sh = Math.min(ox / 2 + 0.4, cap)
-            if ((sh / 100) * (s.w || 800) < 2) continue // soglia morta <2px: niente vibrazione
-            if (ea && eb) { A.x += sgn * sh; B.x -= sgn * sh }
-            else if (ea) { A.x += sgn * sh * 2 }
-            else { B.x -= sgn * sh * 2 }
-          } else {
-            const sgn = (A.y >= B.y ? 1 : -1) || 1
-            const sh = Math.min(oy / 2 + 0.4, cap)
-            if ((sh / 100) * (s.h || 500) < 2) continue // soglia morta <2px: niente vibrazione
-            if (ea && eb) { A.y += sgn * sh; B.y -= sgn * sh }
-            else if (ea) { A.y += sgn * sh * 2 }
-            else { B.y -= sgn * sh * 2 }
-          }
-          try { A.vx = 0; A.vy = 0; B.vx = 0; B.vy = 0 } catch (e) { /* noop */ }
+        if (ox <= 0 || oy <= 0) continue
+        if (ox < oy) {
+          if ((ox / 100) * (s.w || 800) < 2) continue
+          const sgn = (A.x >= B.x ? 1 : -1) || 1
+          const sh = Math.min(ox / 2, (capPx / (s.w || 800)) * 100)
+          A.x += sgn * sh
+          B.x -= sgn * sh
+        } else {
+          if ((oy / 100) * (s.h || 500) < 2) continue
+          const sgn = (A.y >= B.y ? 1 : -1) || 1
+          const sh = Math.min(oy / 2, (capPx / (s.h || 500)) * 100)
+          A.y += sgn * sh
+          B.y -= sgn * sh
         }
       }
     }
+  }
+  function schedule() {
+    if (rafRef.current) return
+    if (typeof requestAnimationFrame === 'undefined') return
+    iterRef.current = 0
+    try { rafRef.current = requestAnimationFrame(frame) } catch (e) { rafRef.current = 0 }
   }
   function frame() {
+    // UNICO rAF loop: solo inerzia con damping exp, poi UNA passata overlap.
     rafRef.current = 0
-    const p = posRef.current
-    const list = Object.keys(p)
-    if (!list.length) return
-    if (++framesRef.current > 600) { try { inertiaRef.current = {} } catch (e) { /* noop */ } return } // guardia anti-loop
-    if (!hasEffActive() && !hasInertia()) { try { applyToDom() } catch (e) { /* noop */ } return } // pose statiche
-    const edgeList = edgesRef.current || []
-    const linked = {}
-    edgeList.forEach((e) => { linked[e.a + '|' + e.b] = e; linked[e.b + '|' + e.a] = e })
-    const area = areaSize.current || { w: 800, h: 500 }
-    let i, j
-    for (i = 0; i < list.length; i++) {
-      const Aid = list[i]
-      if (!effActive(Aid) || frozenId(Aid)) continue // drag/inerzia: zero forze
-      const A = p[Aid]
-      if (!A) continue
-      for (j = i + 1; j < list.length; j++) {
-        const Bid = list[j]
-        if (frozenId(Bid)) continue // mai spingere contro la card in drag/inerzia
-        if (!effActive(Bid) && !effActive(Aid)) continue
-        const B = p[Bid]
-        if (!B) continue
-        const bothEff = effActive(Aid) && effActive(Bid)
-        const e = linked[Aid + '|' + Bid]
-        let dx = A.x - B.x
-        let dy = A.y - B.y
-        let d2 = dx * dx + dy * dy
-        if (d2 < 0.5) { dx = (i - j) || 0.5; dy = (i % 2 ? 1 : -1) * 0.5; d2 = dx * dx + dy * dy }
-        const d = Math.sqrt(d2) || 1
-        const rep = e ? 26 : 90 // non comunicano -> repulsione maggiore
-        const f = Math.min(4, rep / d2)
-        const ux = (dx / d) * f
-        const uy = (dy / d) * f
-        if (bothEff) { A.vx += ux; A.vy += uy; B.vx -= ux; B.vy -= uy }
-        else if (effActive(Aid)) { A.vx += ux; A.vy += uy }
-        else { B.vx -= ux; B.vy -= uy }
-      }
+    const m = posRef.current
+    if (!m || !m.size) return
+    if (++iterRef.current > 1200) {
+      try { m.forEach((P) => { P.vx = 0; P.vy = 0 }) } catch (e) { /* guardia anti-loop */ }
+      try { applyToDom() } catch (e2) { /* noop */ }
+      return
     }
-    edgeList.forEach((e) => {
-      if (!effActive(e.a) || !effActive(e.b) || frozenId(e.a) || frozenId(e.b)) return // edge solo tra effettivi liberi
-      const A = p[e.a]
-      const B = p[e.b]
-      if (!A || !B) return
-      const w = Math.min(30, Number(e.weight) || 1)
-      const rest = Math.max(14, 44 - w * 1.1)
-      const k = 0.02 * (1 + w * 0.15) // attrazione proporzionale al peso live
-      const dx = B.x - A.x
-      const dy = B.y - A.y
-      const d = Math.sqrt(dx * dx + dy * dy) || 1
-      const f = (d - rest) * k
-      const ux = (dx / d) * f
-      const uy = (dy / d) * f
-      A.vx += ux; A.vy += uy; B.vx -= ux; B.vy -= uy
-    })
-    let pushed = false
-    for (i = 0; i < list.length; i++) {
-      for (j = i + 1; j < list.length; j++) {
-        const Aid = list[i]
-        const Bid = list[j]
-        const A = p[Aid]
-        const B = p[Bid]
-        if (!A || !B) continue
-        const ea = effActive(Aid)
-        const eb = effActive(Bid)
-        if (!ea && !eb) continue
-        if (frozenId(Aid) || frozenId(Bid)) continue // anti-overlap mai sulla card in drag/inerzia
-        const sa = sizeOf(Aid)
-        const sb = sizeOf(Bid)
-        const ox = (sa.hw + sb.hw) - Math.abs(A.x - B.x)
-        const oy = (sa.hh + sb.hh) - Math.abs(A.y - B.y)
-        if (ox > 0 && oy > 0) {
-          if (ox < oy) {
-            const sgn = (A.x >= B.x ? 1 : -1) || 1
-            const sh = Math.min(ox / 2 + 0.4, 6)
-            if ((sh / 100) * (area.w || 800) < 2) continue // soglia morta <2px: niente vibrazione
-            pushed = true
-            if (ea && eb) { A.x += sgn * sh; B.x -= sgn * sh; A.vx *= 0.6; B.vx *= 0.6 }
-            else if (ea) { A.x += sgn * sh * 2; A.vx *= 0.6 }
-            else { B.x -= sgn * sh * 2; B.vx *= 0.6 }
-          } else {
-            const sgn = (A.y >= B.y ? 1 : -1) || 1
-            const sh = Math.min(oy / 2 + 0.4, 6)
-            if ((sh / 100) * (area.h || 500) < 2) continue // soglia morta <2px: niente vibrazione
-            pushed = true
-            if (ea && eb) { A.y += sgn * sh; B.y -= sgn * sh; A.vy *= 0.6; B.vy *= 0.6 }
-            else if (ea) { A.y += sgn * sh * 2; A.vy *= 0.6 }
-            else { B.y -= sgn * sh * 2; B.vy *= 0.6 }
-          }
-        }
-      }
-    }
-    let maxD = 0
-    list.forEach((id) => {
-      const P = p[id]
-      if (!P) return
-      const ine = (inertiaRef.current || {})[id]
-      if (ine) {
-        // inerzia post-lancio: scorrimento libero decelerato, NESSUNA forza della fisica
-        P.x = Math.min(97, Math.max(1, P.x + ine.vx))
-        P.y = Math.min(97, Math.max(1, P.y + ine.vy))
-        if (P.x <= 1 || P.x >= 97) ine.vx = 0
-        if (P.y <= 1 || P.y >= 97) ine.vy = 0
-        ine.vx *= 0.82; ine.vy *= 0.82 // damping lancio
-        return
-      }
-      if (frozenId(id)) { P.vx = 0; P.vy = 0; return } // in drag: scrive solo il mousemove
-      if (!effActive(id)) { P.vx = 0; P.vy = 0; return } // fermi: niente gravita/confini
-      P.vx += (50 - P.x) * 0.004
-      P.vy += (60 - P.y) * 0.004 // centro piu in basso: aria verso la top row
-      P.vx *= 0.88; P.vy *= 0.88
-      const nx = Math.min(94, Math.max(4, P.x + P.vx))
-      const ny = Math.min(93, Math.max(14, P.y + P.vy))
-      const dd = Math.max(Math.abs(nx - P.x), Math.abs(ny - P.y))
-      if (dd > maxD) maxD = dd
-      P.x = nx; P.y = ny
-    })
-    // inerzia esaurita (soglia ~0.02px/frame): una sola passata anti-overlap soft, poi stop
-    let stoppedInertia = false
+    const stopped = []
     try {
-      Object.keys(inertiaRef.current || {}).forEach((id) => {
-        const ine = inertiaRef.current[id]
-        if (!ine) return
-        const spx = Math.max(Math.abs(ine.vx) / 100 * (area.w || 800), Math.abs(ine.vy) / 100 * (area.h || 500))
-        if (spx < 0.05) {
-          delete inertiaRef.current[id]
-          stoppedInertia = true
-          if (posRef.current[id]) { posRef.current[id].vx = 0; posRef.current[id].vy = 0 }
+      m.forEach((P) => {
+        if (!hasSpeed(P)) {
+          if (P.vx !== 0 || P.vy !== 0) { P.vx = 0; P.vy = 0 }
+          return
         }
+        let nx = P.x + P.vx
+        let ny = P.y + P.vy
+        if (nx <= 1 || nx >= 97) { nx = Math.min(97, Math.max(1, nx)); P.vx = 0 } // slide: azzera solo l'asse urtato
+        if (ny <= 1 || ny >= 97) { ny = Math.min(97, Math.max(1, ny)); P.vy = 0 }
+        P.x = nx
+        P.y = ny
+        P.vx *= 0.92
+        P.vy *= 0.92
+        if (!hasSpeed(P)) { P.vx = 0; P.vy = 0; stopped.push(1) }
       })
-    } catch (e) { /* inerzia mai fatale */ }
-    if (stoppedInertia) { try { resolveOverlapOnce(true) } catch (e) { /* una sola passata soft */ } }
-    applyToDom()
-    if (pushed || maxD > 0.08 || hasInertia()) {
-      try { rafRef.current = requestAnimationFrame(frame) } catch (e) { rafRef.current = 0 }
+    } catch (e) { /* integrazione mai fatale */ }
+    try { applyToDom() } catch (e) { /* noop */ }
+    if (stopped.length) {
+      // inerzia esaurita: UNA sola passata anti-overlap, poi stop
+      try { resolveOverlapOnce(true) } catch (e) { /* noop */ }
+      try { applyToDom() } catch (e2) { /* noop */ }
     }
+    if (hasInertia()) schedule()
+  }
+  function kick() {
+    // evento reale (dati / drag end / expand / resize): UNA passata + pose,
+    // oppure avvia l'unico loop se c'e inerzia. Mai rAF concorrenti.
+    ensureNodes()
+    syncCardSizes()
+    if (rafRef.current) return
+    if (hasInertia()) { schedule(); return }
+    try { resolveOverlapOnce(false) } catch (e) { /* una sola passata */ }
+    try { applyToDom() } catch (e2) { /* pose statiche */ }
   }
   function startDrag(id, ev) {
     try {
-      if (ev && ev.button !== undefined && ev.button !== 0) return
+      if (ev && ev.pointerType === 'mouse' && ev.button !== undefined && ev.button !== 0) return
       try {
-        // selezione testo: niente drag se il mousedown e su input/testo selezionabile (click ok)
         const t = ev && ev.target
-        if (t && t.closest && t.closest('input,textarea,select,[contenteditable]')) return
+        if (t && t.closest && t.closest('input,textarea,select,[contenteditable]')) return // drag mai da dentro un input
         const sel = (typeof window !== 'undefined' && window.getSelection) ? window.getSelection() : null
         if (sel && !sel.isCollapsed) return
       } catch (e) { /* check best-effort: drag normale */ }
-      const P = posRef.current[id]
+      const P = posRef.current.get(id)
       const s = areaSize.current || { w: 800, h: 500 }
       if (!P || !s.w) return
-      try { if (inertiaRef.current && inertiaRef.current[id]) delete inertiaRef.current[id] } catch (e) { /* il drag cancella l'inerzia */ }
-      const sx = (ev && ev.clientX !== undefined) ? ev.clientX : 0
-      const sy = (ev && ev.clientY !== undefined) ? ev.clientY : 0
-      const dead = isExp(id) ? 10 : 5
-      dragRef.current = { id, sx, sy, ox: P.x, oy: P.y, dead, moved: false, hist: [] }
+      P.vx = 0
+      P.vy = 0 // il drag cancella l'inerzia
+      const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()
+      dragRef.current = {
+        id, pid: ev ? ev.pointerId : undefined,
+        sx: (ev && ev.clientX !== undefined) ? ev.clientX : 0,
+        sy: (ev && ev.clientY !== undefined) ? ev.clientY : 0,
+        ox: P.x, oy: P.y, moved: false,
+        hist: [{ x: (ev && ev.clientX) || 0, y: (ev && ev.clientY) || 0, t: now }],
+      }
       try {
-        if (ev && ev.currentTarget && ev.currentTarget.classList) ev.currentTarget.classList.add('uff-drag')
+        const node = (ev && ev.currentTarget) || cardEls.current[id]
+        if (node && node.setPointerCapture && ev && ev.pointerId !== undefined) node.setPointerCapture(ev.pointerId)
+      } catch (e) { /* capture opzionale */ }
+      try {
+        const el = cardEls.current[id]
+        if (el && el.classList) el.classList.add('uff-drag')
       } catch (e) { /* noop */ }
-      const onMove = (me) => {
-        try {
-          const dr = dragRef.current
-          if (!dr || dr.id !== id) return
-          const dxPx = (me.clientX || 0) - dr.sx
-          const dyPx = (me.clientY || 0) - dr.sy
-          const dist = Math.sqrt(dxPx * dxPx + dyPx * dyPx)
-          if (!dr.moved && dist < dr.dead) return // deadzone: ancora click
-          dr.moved = true
-          try {
-            // campiona gli ultimi spostamenti (~80ms) per la velocity al rilascio
-            const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()
-            dr.hist.push({ t: now, x: me.clientX || 0, y: me.clientY || 0 })
-            while (dr.hist.length > 8) dr.hist.shift()
-            while (dr.hist.length > 2 && (now - dr.hist[0].t) > 120) dr.hist.shift()
-          } catch (e) { /* campionamento best-effort */ }
-          const Q = posRef.current[id]
-          if (!Q) return
-          Q.x = Math.min(97, Math.max(1, dr.ox + (dxPx / s.w) * 100))
-          Q.y = Math.min(97, Math.max(1, dr.oy + (dyPx / s.h) * 100))
-          Q.vx = 0; Q.vy = 0
-          suppressRef.current[id] = Date.now()
-          applyToDom()
-          if (me.preventDefault) me.preventDefault()
-        } catch (e) { /* drag best-effort */ }
-      }
-      const onUp = () => {
-        try {
-          const dr = dragRef.current
-          const wasMoved = !!(dr && dr.moved)
-          dragRef.current = null
-          try {
-            if (ev && ev.currentTarget && ev.currentTarget.classList) ev.currentTarget.classList.remove('uff-drag')
-          } catch (e2) { /* noop */ }
-          try { window.removeEventListener('mousemove', onMove) } catch (e2) { /* noop */ }
-          try { window.removeEventListener('mouseup', onUp) } catch (e2) { /* noop */ }
-          if (wasMoved) {
-            suppressRef.current[id] = Date.now()
-            // inerzia leggera: velocity media degli ultimi campioni (~80ms), clamp anti-lanci
-            try {
-              const h = (dr && dr.hist) || []
-              if (h.length >= 2 && posRef.current[id]) {
-                const a = h[0]
-                const b = h[h.length - 1]
-                const dt = Math.max(1, b.t - a.t)
-                if (dt >= 8) {
-                  let vx = (((b.x - a.x) / dt) * 16.7) // px/frame
-                  let vy = (((b.y - a.y) / dt) * 16.7)
-                  const sp = Math.sqrt(vx * vx + vy * vy)
-                  const MAXV = 28 // clamp: niente lanci violenti
-                  if (sp > MAXV) { vx *= MAXV / sp; vy *= MAXV / sp }
-                  if (sp >= 1.5) {
-                    const s2 = areaSize.current || { w: 800, h: 500 }
-                    inertiaRef.current[id] = { vx: (vx / (s2.w || 800)) * 100, vy: (vy / (s2.h || 500)) * 100 }
-                  }
-                }
-              }
-            } catch (e) { /* niente inerzia: drop secco */ }
-            kick() // loop per l'inerzia, o un solo reflow dopo il drop secco
-          }
-        } catch (e) { /* noop */ }
-      }
-      try { window.addEventListener('mousemove', onMove) } catch (e) { /* noop */ }
-      try { window.addEventListener('mouseup', onUp) } catch (e) { /* noop */ }
     } catch (e) { /* drag mai fatale */ }
+  }
+  function moveDrag(id, ev) {
+    try {
+      const dr = dragRef.current
+      if (!dr || dr.id !== id) return
+      if (ev && ev.pointerId !== undefined && dr.pid !== undefined && ev.pointerId !== dr.pid) return
+      const dxPx = (ev.clientX || 0) - dr.sx
+      const dyPx = (ev.clientY || 0) - dr.sy
+      if (!dr.moved && Math.sqrt(dxPx * dxPx + dyPx * dyPx) < 4) return // deadzone: ancora click
+      dr.moved = true
+      try {
+        const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()
+        dr.hist.push({ x: ev.clientX || 0, y: ev.clientY || 0, t: now })
+        while (dr.hist.length > 5) dr.hist.shift()
+      } catch (e) { /* campionamento best-effort */ }
+      const s = areaSize.current || { w: 800, h: 500 }
+      const Q = posRef.current.get(id)
+      if (!Q) return
+      Q.x = Math.min(97, Math.max(1, dr.ox + (dxPx / (s.w || 800)) * 100))
+      Q.y = Math.min(97, Math.max(1, dr.oy + (dyPx / (s.h || 500)) * 100))
+      Q.vx = 0
+      Q.vy = 0
+      applyToDom() // scrittura diretta: niente re-render, niente fisica
+    } catch (e) { /* drag best-effort */ }
+  }
+  function endDrag(id, ev) {
+    try {
+      const dr = dragRef.current
+      if (!dr || dr.id !== id) return
+      if (ev && ev.pointerId !== undefined && dr.pid !== undefined && ev.pointerId !== dr.pid) return
+      dragRef.current = null
+      try {
+        const el = cardEls.current[id]
+        if (el && el.classList) el.classList.remove('uff-drag')
+      } catch (e2) { /* noop */ }
+      try {
+        const node = (ev && ev.currentTarget) || cardEls.current[id]
+        if (node && node.releasePointerCapture && ev && ev.pointerId !== undefined) node.releasePointerCapture(ev.pointerId)
+      } catch (e3) { /* noop */ }
+      if (!dr.moved) return
+      suppressRef.current[id] = Date.now() // oltre la deadzone il click viene soppresso
+      try {
+        // inerzia: media mobile delle ultime 3 mosse pointermove
+        const h = dr.hist || []
+        if (h.length >= 2 && posRef.current.get(id)) {
+          const a = h[Math.max(0, h.length - 3)]
+          const b = h[h.length - 1]
+          const dt = Math.max(1, b.t - a.t)
+          if (dt >= 8) {
+            let vx = (((b.x - a.x) / dt) * 16.7) // px/frame
+            let vy = (((b.y - a.y) / dt) * 16.7)
+            const sp = Math.sqrt(vx * vx + vy * vy)
+            const MAXV = 24 // clamp: niente lanci violenti
+            if (sp > MAXV) { vx *= MAXV / sp; vy *= MAXV / sp }
+            if (sp >= 1.5) {
+              const s2 = areaSize.current || { w: 800, h: 500 }
+              const P = posRef.current.get(id)
+              P.vx = (vx / (s2.w || 800)) * 100
+              P.vy = (vy / (s2.h || 500)) * 100
+            }
+          }
+        }
+      } catch (e) { /* niente inerzia: drop secco */ }
+      kick() // loop per l'inerzia, o un solo reflow dopo il drop secco
+    } catch (e) { /* noop */ }
   }
   function consumeSuppress(id) {
     try {
@@ -669,18 +604,34 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
     } catch (e) { return false }
   }
   useEffect(() => {
-    const pr = posRef.current
-    ;(ids || []).forEach((id, i) => {
-      if (!pr[id]) {
-        pr[id] = { x: 10 + 80 * (((i + 1) * 0.61803) % 1), y: 28 + 58 * (((i + 1) * 0.38197) % 1), vx: 0, vy: 0 }
-      }
-    })
-    Object.keys(pr).forEach((k) => { if ((ids || []).indexOf(k) < 0) delete pr[k] })
-    Object.keys(inertiaRef.current || {}).forEach((k) => { if ((ids || []).indexOf(k) < 0) delete inertiaRef.current[k] })
+    ensureNodes()
     setStruct((v) => v + 1)
     kick()
     return undefined
   }, [idsKey])
+  useEffect(() => {
+    // expand/collapse: il nodo in transition (180ms) resta frozen 200ms.
+    // FIX v0.5.1: usa SUBITO la size FINALE target nel motore (mai la size
+    // animata) e UNA sola passata anti-overlap a toggle — niente secondo
+    // kick a 220ms, niente misure DOM durante la transition.
+    try {
+      const prev = prevExpRef.current
+      if (prev !== '__init__' && prev !== expandedKey) {
+        const before = {}
+        prev.split(',').filter(Boolean).forEach((k) => { before[k] = true })
+        const nowIds = {}
+        expandedKey.split(',').filter(Boolean).forEach((k) => { nowIds[k] = true })
+        const now = Date.now()
+        Object.keys(before).forEach((k) => { if (!nowIds[k]) { frozenUntilRef.current[k] = now + 200; cardSize.current[k] = { w: 250, h: 170 } } })
+        Object.keys(nowIds).forEach((k) => { if (!before[k]) { frozenUntilRef.current[k] = now + 200; cardSize.current[k] = { w: 420, h: 380 } } })
+        kick()
+        prevExpRef.current = expandedKey
+        return undefined
+      }
+      prevExpRef.current = expandedKey
+    } catch (e) { /* toggle mai fatale */ }
+    return undefined
+  }, [expandedKey])
   useEffect(() => {
     const el = areaEl.current
     if (!el || typeof ResizeObserver === 'undefined') return undefined
@@ -699,7 +650,9 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
     return () => { try { if (ro) ro.disconnect() } catch (e) { /* noop */ } }
   }, [])
   useEffect(() => () => { try { if (rafRef.current) cancelAnimationFrame(rafRef.current) } catch (e) { /* noop */ } }, [])
-  return { pos: posRef.current, cardEls, wireEls, areaEl, kick, startDrag, consumeSuppress }
+  const snap = {}
+  try { posRef.current.forEach((P, id) => { snap[id] = P }) } catch (e) { /* snapshot best-effort */ }
+  return { pos: snap, cardEls, wireEls, areaEl, areaSize, kick, startDrag, moveDrag, endDrag, consumeSuppress }
 }
 
 /* Segmento elbow ortogonale in PIXEL interi (spazio 1:1, niente viewBox) ---- */
@@ -921,13 +874,14 @@ function UfficiTab(props) {
         setZMap((prev) => ({ ...(prev || {}), [oid]: z }))
         setSelAgent(null)
       }
-      setTimeout(() => { try { layout.kick() } catch (e) { /* motore non pronto */ } }, 30)
+      // FIX v0.5.1: niente kick a 30ms (misurerebbe la width a meta transition);
+      // il kick singolo con size finali lo fa l'effetto motore su expandedKey.
     } catch (e) { /* toggle mai fatale */ }
   }
   const collapse = (oid) => {
     try {
       setExpandedIds((prev) => (prev || []).filter((x) => x !== oid))
-      setTimeout(() => { try { layout.kick() } catch (e) { /* noop */ } }, 30)
+      // FIX v0.5.1: come sopra, kick solo dall'effetto motore su expandedKey.
     } catch (e) { /* noop */ }
   }
 
@@ -948,7 +902,9 @@ function UfficiTab(props) {
   const dataSig = (agents || []).length + ':' + (chats || []).reduce((n, c) => n + (((c && c.messages) || []).length), 0) + ':' + (((tasksData && tasksData.tasks) || []).length)
   useEffect(() => {
     try { layout.kick() } catch (e) { /* motore non pronto */ }
-  }, [edgesSig, expandedKey, activeSig, dataSig, details])
+    // FIX v0.5.1: expandedKey gestito SOLO dall'effetto motore (singola
+    // passata con size finali a toggle) — qui solo cambi dati reali.
+  }, [edgesSig, activeSig, dataSig, details])
 
   const openChat = (c, wantOpen) => {
     try {
@@ -1008,14 +964,20 @@ function UfficiTab(props) {
     let X0 = 800
     let Y0 = 500
     try {
-      const s = { w: 800, h: 500 }
-      X0 = Math.round((p.x / 100) * s.w)
-      Y0 = Math.round((p.y / 100) * s.h)
+      // FIX v0.5.1: stessa area misurata di applyToDom (mai 800x500 fissi),
+      // altrimenti ogni re-render (poll 2s) sovrascrive il translate3d del
+      // drag con coordinate sbagliate = vibrazione/lotta col mouse.
+      const ar = (layout.areaSize && layout.areaSize.current) || { w: 800, h: 500 }
+      X0 = Math.round((p.x / 100) * (ar.w || 800))
+      Y0 = Math.round((p.y / 100) * (ar.h || 500))
     } catch (e) { /* fallback */ }
     return jsx('div', {
       key: oid,
       ref: (el) => { try { if (el) layout.cardEls.current[oid] = el; else delete layout.cardEls.current[oid] } catch (e) { /* noop */ } },
-      onMouseDown: (ev) => { try { layout.startDrag(oid, ev) } catch (e) { /* drag mai fatale */ } },
+      onPointerDown: (ev) => { try { layout.startDrag(oid, ev) } catch (e) { /* drag mai fatale */ } },
+      onPointerMove: (ev) => { try { layout.moveDrag(oid, ev) } catch (e) { /* drag mai fatale */ } },
+      onPointerUp: (ev) => { try { layout.endDrag(oid, ev) } catch (e) { /* drag mai fatale */ } },
+      onPointerCancel: (ev) => { try { layout.endDrag(oid, ev) } catch (e) { /* drag mai fatale */ } },
       onClick: (ev) => { try { if (layout.consumeSuppress(oid)) { ev.stopPropagation(); return } } catch (e) { /* noop */ } },
       className: cardBase + (st.flash ? ' uff-flash' : (st.active ? ' uff-active' : '')) + ' absolute',
       style: {
@@ -1026,7 +988,9 @@ function UfficiTab(props) {
         background: 'var(--card)', opacity: 1, color: 'var(--foreground, var(--ui-text-primary))',
         border: '1px solid ' + (expanded ? 'var(--accent, var(--ui-accent))' : borderCol), borderRadius: 10,
         boxShadow: expanded ? '0 14px 36px rgba(0,0,0,.32)' : 'none',
-        cursor: 'grab',
+        cursor: 'grab', touchAction: expanded ? 'pan-y' : 'none',
+        willChange: 'transform',
+        transition: 'width .18s ease-out,height .18s ease-out,border-color .2s ease,box-shadow .2s ease',
       },
       children: [
         jsx('div', {
@@ -1091,7 +1055,7 @@ function UfficiTab(props) {
         expanded ? jsxs('div', {
           key: 'x', className: 'flex flex-col gap-1.5 pt-1 border-t border-(--ui-stroke-secondary)',
           onClick: (ev) => ev.stopPropagation(),
-          onMouseDown: (ev) => ev.stopPropagation(),
+          onPointerDown: (ev) => ev.stopPropagation(), onMouseDown: (ev) => ev.stopPropagation(),
           children: [
             jsxs('div', {
               key: 'xh', className: 'flex items-center gap-1.5',
@@ -1108,7 +1072,7 @@ function UfficiTab(props) {
                 (st.chats || []).length
                   ? (st.chats || []).slice(0, 6).map((c) => jsxs('div', {
                     key: (c && c.id) || (c && c.name), className: 'flex items-center gap-1.5',
-                    onMouseDown: (ev) => ev.stopPropagation(),
+                    onPointerDown: (ev) => ev.stopPropagation(), onMouseDown: (ev) => ev.stopPropagation(),
                     children: [
                       jsx('span', { key: 'n', className: 'text-[0.68rem] truncate flex-1', children: (c && c.name) || (c && c.id) || '—' }),
                       jsx('span', { key: 'c', className: 'text-[0.6rem] text-(--ui-text-quaternary)', children: '' + ((c && c.messages) || []).length }),

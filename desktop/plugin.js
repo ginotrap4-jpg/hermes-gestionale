@@ -1,4 +1,4 @@
-/** Gestionale Hermes — desktop plugin v0.5.1.
+/** Gestionale Hermes — desktop plugin v0.5.2.
  * Sidebar /gestionale con tab: Uffici (top row Orchestratore + Knowledge Keeper,
  * worker force-directed con card rettangolari, glifi, mini-task, elbow lines),
  * Chat, Automazioni (last_run_at + Esegui ora + Log), Output (file explorer),
@@ -13,6 +13,15 @@
  * sola passata tra nodi fermi non-espansi cap 6px/8px soglia 2px; misure in
  * cache + ResizeObserver; espansa con transition 180ms, frozen 200ms,
  * resta draggable; niente drag da input/textarea/select/contenteditable).
+ * v0.5.2: (1) anti-overlap CON expanded (size finali 420x420 vs 250x170):
+ * expand = strong push-out a passata singola che ancora la card espansa e
+ * sposta i vicini FUORI; drop dopo drag = strong push-out inclusa la
+ * dragged; settle post-inerzia = strong push-out. (2) multi-expand: toggle
+ * per-id su array + fetch detail per-id indipendente con fallback
+ * {_missing:true} (la section base con activity resta sempre visibile).
+ * (3) logger runtime: DEBUG_GEST=false, on con localStorage 'gest-debug'=1,
+ * console '[gest]' + window.__GEST_DEBUG__ {events,dump,copy} + bottone
+ * 'Debug: copia log' visibile solo a debug attivo.
  * v0.4.3: (1) NESSUNO scale()/zoom sul contenitore: posizioni snap a px
  * interi (Math.round), misure via offsetWidth/offsetHeight (non getBoundingRect
  * su elemento trasformato), SVG in spazio pixel 1:1 (no viewBox stretch) +
@@ -48,6 +57,54 @@ const ROOT = '/opt/data/output'
 const KANBAN = ['backlog', 'todo', 'in_progress', 'in_review', 'done']
 const KANBAN_LABEL = { backlog: 'Backlog', todo: 'Da fare', in_progress: 'In corso', in_review: 'In revisione', done: 'Fatti' }
 const TABS = [['uffici', 'Uffici'], ['chat', 'Chat'], ['automazioni', 'Automazioni'], ['output', 'Output'], ['progetti', 'Progetti']]
+
+/* Logger runtime v0.5.2 — spento di default, on con localStorage 'gest-debug'='1'.
+ * Logga: toggle expand (id), kick/passate anti-overlap (spostamenti),
+ * drag start/end (posizione), fetch detail (errori con path+status).
+ * Dump: window.__GEST_DEBUG__.dump() in DevTools (Electron: Ctrl+Shift+I). */
+const DEBUG_GEST = false
+function gestDebugOn() {
+  try {
+    if (typeof localStorage !== 'undefined' && localStorage.getItem('gest-debug') === '1') return true
+  } catch (e) { /* storage non disponibile */ }
+  return DEBUG_GEST
+}
+function gestLog(msg, data) {
+  try {
+    if (!gestDebugOn()) return
+    let ts = ''
+    try { ts = new Date().toISOString().slice(11, 23) } catch (e) { ts = '' + Date.now() }
+    const entry = { t: ts, msg: String(msg), data: (data === undefined ? null : data) }
+    try {
+      if (typeof window !== 'undefined') {
+        window.__GEST_DEBUG__ = window.__GEST_DEBUG__ || { events: [] }
+        window.__GEST_DEBUG__.events.push(entry)
+        if (window.__GEST_DEBUG__.events.length > 300) window.__GEST_DEBUG__.events.splice(0, window.__GEST_DEBUG__.events.length - 300)
+      }
+    } catch (e) { /* buffer opzionale */ }
+    try { console.log('[gest]', ts, msg, (data === undefined ? '' : data)) } catch (e2) { /* noop */ }
+  } catch (e) { /* logger mai fatale */ }
+}
+try {
+  if (typeof window !== 'undefined') {
+    window.__GEST_DEBUG__ = window.__GEST_DEBUG__ || { events: [] }
+    if (!window.__GEST_DEBUG__.dump) {
+      window.__GEST_DEBUG__.dump = function () {
+        try { return JSON.stringify((window.__GEST_DEBUG__ && window.__GEST_DEBUG__.events) || []) } catch (e) { return '[]' }
+      }
+    }
+    if (!window.__GEST_DEBUG__.copy) {
+      window.__GEST_DEBUG__.copy = function () {
+        try {
+          const txt = window.__GEST_DEBUG__.dump()
+          if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(txt)
+          try { console.log('[gest] dump', txt) } catch (e) { /* noop */ }
+          return Promise.resolve(txt)
+        } catch (e) { return Promise.reject(e) }
+      }
+    }
+  }
+} catch (e) { /* setup debug mai fatale */ }
 
 async function api(path, opts) {
   try {
@@ -267,17 +324,17 @@ function msgTs(m) {
   return t
 }
 
-/* Motore layout/drag v0.5 — riscrittura stabile -----------------------------------
+/* Motore layout/drag v0.5.2 — riscrittura stabile -----------------------------------
  * Single source of truth: Map<id,{x,y,vx,vy}> in posRef (unita 0..100).
  * Drag: pointerdown con setPointerCapture sulla card; pointermove scrive
  * DIRETTAMENTE translate3d nel DOM + Map (zero re-render, zero fisica sul
  * nodo dragged). Pointerup: release capture + media mobile delle ultime 3
  * mosse convertita in inerzia. UN SOLO rAF per tutto: integra solo l'inerzia
  * (damping exp 0.92, stop sotto |vx|+|vy|<0.01, slide sui confini, mai
- * getBoundingClientRect nel loop). Anti-overlap: SOLO tra nodi fermi
- * non-espansi, UNA passata per evento reale (asse minore, meta overlap per
- * lato, cap 6px/step — 8px post-inerzia — soglia 2px, niente loop).
- * Misure in cache a mount + ResizeObserver. Card espansa: width/height con
+ * getBoundingClientRect nel loop). Anti-overlap gentle (cap 6/8px, soglia 2px,
+ * include le espanse) + strong push-out v0.5.2 a separazione totale su expand
+ * (ancora la card espansa), drop dopo drag (dragged inclusa) e settle
+ * post-inerzia. Misure in cache + ResizeObserver. Card espansa: width/height
  * transition 180ms ease-out, frozen 200ms durante la transition, resta
  * draggable. Niente drag da input/textarea/select/contenteditable o con
  * selezione testo attiva.
@@ -315,14 +372,16 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
       return found
     } catch (e) { return false }
   }
+  function isFrozen(id) { try { return Date.now() < (frozenUntilRef.current[id] || 0) } catch (e) { return false } }
   function eligible(id) {
-    // anti-overlap solo tra nodi fermi non-espansi: mai dragged, mai inerzia, mai frozen
-    if (isExp(id)) return false
+    // v0.5.2: anti-overlap INCLUDE le card espanse (size finali in halfOf).
+    // Movibile = non dragged, senza inerzia, non in transition (frozen).
+    // Le frozen/espanse restano ostacoli nel push-out forte (resolveOverlapPush).
     if (isDragged(id)) return false
     try {
       const P = posRef.current.get(id)
       if (P && hasSpeed(P)) return false
-      if (Date.now() < (frozenUntilRef.current[id] || 0)) return false
+      if (isFrozen(id)) return false
     } catch (e) { return false }
     return true
   }
@@ -337,7 +396,7 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
             vx: 0, vy: 0,
           })
         }
-        if (!cardSize.current[id]) cardSize.current[id] = isExp(id) ? { w: 420, h: 380 } : { w: 250, h: 170 }
+        if (!cardSize.current[id]) cardSize.current[id] = isExp(id) ? { w: 420, h: 420 } : { w: 250, h: 170 }
       })
       Array.from(m.keys()).forEach((k) => {
         if ((ids || []).indexOf(k) < 0) {
@@ -352,7 +411,7 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
     const s = areaSize.current || { w: 800, h: 500 }
     let c = null
     try { c = cardSize.current[id] || null } catch (e) { c = null }
-    if (!c) c = isExp(id) ? { w: 420, h: 380 } : { w: 250, h: 170 }
+    if (!c) c = isExp(id) ? { w: 420, h: 420 } : { w: 250, h: 170 }
     return { hw: (((c.w || 250) / 2 + 16) / (s.w || 800)) * 100, hh: (((c.h || 170) / 2 + 16) / (s.h || 500)) * 100 }
   }
   function syncCardSizes() {
@@ -363,7 +422,7 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
     try {
       const nowMs = Date.now()
       Object.keys(cardEls.current || {}).forEach((id) => {
-        if (isExp(id)) { cardSize.current[id] = { w: 420, h: 380 }; return }
+        if (isExp(id)) { cardSize.current[id] = { w: 420, h: 420 }; return }
         if (nowMs < (frozenUntilRef.current[id] || 0)) return
         let el = null
         try { el = cardEls.current[id] } catch (e) { el = null }
@@ -411,9 +470,10 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
       })
     } catch (e3) { /* ancore opzionali */ }
   }
-  function resolveOverlapOnce(afterInertia) {
+  function resolveOverlapOnce(afterInertia, reason) {
     // UNA sola passata, niente loop: meta overlap per lato sull'asse minore.
     // Cap 6px/step (8px post-inerzia), soglia 2px: sotto soglia niente tocchi.
+    // v0.5.2: include le espanse (eligible non le esclude piu); log spostamenti.
     const m = posRef.current
     const s = areaSize.current || { w: 800, h: 500 }
     const capPx = afterInertia ? 8 : 6
@@ -421,6 +481,8 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
     try {
       m.forEach((P, id) => { if (eligible(id)) list.push(id) })
     } catch (e) { return }
+    let pairs = 0
+    const disp = []
     for (let i = 0; i < list.length; i++) {
       for (let j = i + 1; j < list.length; j++) {
         const A = m.get(list[i])
@@ -437,15 +499,92 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
           const sh = Math.min(ox / 2, (capPx / (s.w || 800)) * 100)
           A.x += sgn * sh
           B.x -= sgn * sh
+          pairs++
+          if (disp.length < 12) disp.push(list[i] + '<->' + list[j] + ':dx' + sh.toFixed(2))
         } else {
           if ((oy / 100) * (s.h || 500) < 2) continue
           const sgn = (A.y >= B.y ? 1 : -1) || 1
           const sh = Math.min(oy / 2, (capPx / (s.h || 500)) * 100)
           A.y += sgn * sh
           B.y -= sgn * sh
+          pairs++
+          if (disp.length < 12) disp.push(list[i] + '<->' + list[j] + ':dy' + sh.toFixed(2))
         }
       }
     }
+    try { if (pairs) gestLog('overlap-gentle' + (reason ? ' ' + reason : ''), { pairs, disp }) } catch (e) { /* noop */ }
+  }
+  function resolveOverlapPush(fixed, reason) {
+    // v0.5.2 STRONG push-out: UNA sola spazzata su coppie, separazione TOTALE
+    // (niente cap) con size finali di TUTTE (espanse 420x420 incluse).
+    // fixed = id (o mappa {id:true}) ancorato: non si muove ma spinge i vicini
+    // FUORI. Le frozen (in transition 200ms) sono ancore come fixed.
+    // Usato su: expand (fixed=card espansa), drop dopo drag (fixed=null,
+    // dragged inclusa), settle post-inerzia (fixed=null).
+    const m = posRef.current
+    const isFixed = (id) => {
+      try {
+        if (!id) return false
+        if (typeof fixed === 'string' && id === fixed) return true
+        if (fixed && typeof fixed === 'object' && fixed[id]) return true
+        if (isFrozen(id)) return true
+        return false
+      } catch (e) { return false }
+    }
+    const ids = []
+    try {
+      m.forEach((P, id) => {
+        if (isDragged(id)) return // drag live: niente tocchi; dopo il fermo dragRef e null
+        if (P && hasSpeed(P)) return
+        ids.push(id)
+      })
+    } catch (e) { return 0 }
+    let pairs = 0
+    const disp = []
+    for (let i = 0; i < ids.length; i++) {
+      for (let j = i + 1; j < ids.length; j++) {
+        const a = ids[i]
+        const b = ids[j]
+        const A = m.get(a)
+        const B = m.get(b)
+        if (!A || !B) continue
+        const sa = halfOf(a)
+        const sb = halfOf(b)
+        const ox = (sa.hw + sb.hw) - Math.abs(A.x - B.x)
+        const oy = (sa.hh + sb.hh) - Math.abs(A.y - B.y)
+        if (ox <= 0 || oy <= 0) continue
+        const aF = isFixed(a)
+        const bF = isFixed(b)
+        if (aF && bF) continue
+        if (ox < oy) {
+          const sgn = (A.x >= B.x ? 1 : -1) || 1
+          let sh = 0
+          if (!aF && !bF) { sh = ox / 2 + 0.3; A.x += sgn * sh; B.x -= sgn * sh }
+          else if (!aF) { sh = ox + 0.4; A.x += sgn * sh }
+          else { sh = ox + 0.4; B.x -= sgn * sh }
+          A.x = Math.min(97, Math.max(1, A.x))
+          B.x = Math.min(97, Math.max(1, B.x))
+          A.y = Math.min(97, Math.max(1, A.y))
+          B.y = Math.min(97, Math.max(1, B.y))
+          pairs++
+          if (disp.length < 12) disp.push(a + (aF ? '(f)' : '') + '<->' + b + (bF ? '(f)' : '') + ':dx' + sh.toFixed(2))
+        } else {
+          const sgn = (A.y >= B.y ? 1 : -1) || 1
+          let sh = 0
+          if (!aF && !bF) { sh = oy / 2 + 0.3; A.y += sgn * sh; B.y -= sgn * sh }
+          else if (!aF) { sh = oy + 0.4; A.y += sgn * sh }
+          else { sh = oy + 0.4; B.y -= sgn * sh }
+          A.x = Math.min(97, Math.max(1, A.x))
+          B.x = Math.min(97, Math.max(1, B.x))
+          A.y = Math.min(97, Math.max(1, A.y))
+          B.y = Math.min(97, Math.max(1, B.y))
+          pairs++
+          if (disp.length < 12) disp.push(a + (aF ? '(f)' : '') + '<->' + b + (bF ? '(f)' : '') + ':dy' + sh.toFixed(2))
+        }
+      }
+    }
+    try { gestLog('overlap-push' + (reason ? ' ' + reason : ''), { pairs, disp, fixed: (typeof fixed === 'string' ? fixed : (fixed ? Object.keys(fixed) : null)) }) } catch (e) { /* noop */ }
+    return pairs
   }
   function schedule() {
     if (rafRef.current) return
@@ -483,20 +622,33 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
     } catch (e) { /* integrazione mai fatale */ }
     try { applyToDom() } catch (e) { /* noop */ }
     if (stopped.length) {
-      // inerzia esaurita: UNA sola passata anti-overlap, poi stop
-      try { resolveOverlapOnce(true) } catch (e) { /* noop */ }
+      // v0.5.2: inerzia esaurita: UNO strong push-out (separazione totale,
+      // dragged inclusa — dragRef e gia null) poi stop
+      try { resolveOverlapPush(null, 'inertia-settle') } catch (e) { /* noop */ }
       try { applyToDom() } catch (e2) { /* noop */ }
     }
     if (hasInertia()) schedule()
   }
-  function kick() {
+  function kick(opts) {
     // evento reale (dati / drag end / expand / resize): UNA passata + pose,
     // oppure avvia l'unico loop se c'e inerzia. Mai rAF concorrenti.
+    // v0.5.2: opts {strong, fixed, reason} — strong = push-out totale
+    // (expand/drop), default = gentle cappato (poll dati/resize).
     ensureNodes()
     syncCardSizes()
+    let strong = false
+    let fixed = null
+    let reason = ''
+    try {
+      if (opts && typeof opts === 'object') { strong = !!opts.strong; fixed = opts.fixed || null; reason = opts.reason || '' }
+      else if (typeof opts === 'string' && opts) reason = opts
+    } catch (e) { /* opts opzionali */ }
     if (rafRef.current) return
     if (hasInertia()) { schedule(); return }
-    try { resolveOverlapOnce(false) } catch (e) { /* una sola passata */ }
+    try {
+      if (strong) resolveOverlapPush(fixed, reason)
+      else resolveOverlapOnce(false, reason)
+    } catch (e) { /* una sola passata */ }
     try { applyToDom() } catch (e2) { /* pose statiche */ }
   }
   function startDrag(id, ev) {
@@ -529,6 +681,10 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
         const el = cardEls.current[id]
         if (el && el.classList) el.classList.add('uff-drag')
       } catch (e) { /* noop */ }
+      try {
+        const PP = posRef.current.get(id)
+        gestLog('drag-start', { id, x: PP ? +PP.x.toFixed(2) : null, y: PP ? +PP.y.toFixed(2) : null })
+      } catch (e) { /* log mai fatale */ }
     } catch (e) { /* drag mai fatale */ }
   }
   function moveDrag(id, ev) {
@@ -569,7 +725,13 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
         const node = (ev && ev.currentTarget) || cardEls.current[id]
         if (node && node.releasePointerCapture && ev && ev.pointerId !== undefined) node.releasePointerCapture(ev.pointerId)
       } catch (e3) { /* noop */ }
-      if (!dr.moved) return
+      if (!dr.moved) {
+        try {
+          const PP0 = posRef.current.get(id)
+          gestLog('drag-end-click', { id, x: PP0 ? +PP0.x.toFixed(2) : null, y: PP0 ? +PP0.y.toFixed(2) : null })
+        } catch (e) { /* log mai fatale */ }
+        return
+      }
       suppressRef.current[id] = Date.now() // oltre la deadzone il click viene soppresso
       try {
         // inerzia: media mobile delle ultime 3 mosse pointermove
@@ -593,7 +755,11 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
           }
         }
       } catch (e) { /* niente inerzia: drop secco */ }
-      kick() // loop per l'inerzia, o un solo reflow dopo il drop secco
+      kick({ strong: true, reason: 'drop:' + id }) // loop per l'inerzia, o strong push-out dopo il drop secco (dragged inclusa)
+      try {
+        const PP2 = posRef.current.get(id)
+        gestLog('drag-end', { id, x: PP2 ? +PP2.x.toFixed(2) : null, y: PP2 ? +PP2.y.toFixed(2) : null })
+      } catch (e) { /* log mai fatale */ }
     } catch (e) { /* noop */ }
   }
   function consumeSuppress(id) {
@@ -611,9 +777,10 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
   }, [idsKey])
   useEffect(() => {
     // expand/collapse: il nodo in transition (180ms) resta frozen 200ms.
-    // FIX v0.5.1: usa SUBITO la size FINALE target nel motore (mai la size
-    // animata) e UNA sola passata anti-overlap a toggle — niente secondo
-    // kick a 220ms, niente misure DOM durante la transition.
+    // v0.5.2: usa SUBITO la size FINALE target nel motore (mai la size
+    // animata) e UNO strong push-out a toggle che ancora la/le card appena
+    // espanse e sposta i vicini FUORI — niente secondo kick, niente misure
+    // DOM durante la transition.
     try {
       const prev = prevExpRef.current
       if (prev !== '__init__' && prev !== expandedKey) {
@@ -622,9 +789,12 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
         const nowIds = {}
         expandedKey.split(',').filter(Boolean).forEach((k) => { nowIds[k] = true })
         const now = Date.now()
+        const fresh = {}
         Object.keys(before).forEach((k) => { if (!nowIds[k]) { frozenUntilRef.current[k] = now + 200; cardSize.current[k] = { w: 250, h: 170 } } })
-        Object.keys(nowIds).forEach((k) => { if (!before[k]) { frozenUntilRef.current[k] = now + 200; cardSize.current[k] = { w: 420, h: 380 } } })
-        kick()
+        Object.keys(nowIds).forEach((k) => { if (!before[k]) { frozenUntilRef.current[k] = now + 200; cardSize.current[k] = { w: 420, h: 420 }; fresh[k] = true } })
+        try { gestLog('expand-effect', { expanded: expandedKey, fresh: Object.keys(fresh) }) } catch (e) { /* noop */ }
+        if (Object.keys(fresh).length) kick({ strong: true, fixed: fresh, reason: 'expand' })
+        else kick({ reason: 'collapse' })
         prevExpRef.current = expandedKey
         return undefined
       }
@@ -864,35 +1034,65 @@ function UfficiTab(props) {
   const activeSig = (activeIds || []).slice().sort().join(',')
   const isExpanded = (oid) => (expandedIds || []).indexOf(oid) >= 0
   const toggleExpand = (oid) => {
+    // v0.5.2: toggle per-id su array — multi-expand, mai reset globale.
     try {
       const has = (expandedIds || []).indexOf(oid) >= 0
+      try { gestLog('toggle-expand', { id: oid, to: has ? 'collapse' : 'expand', before: (expandedIds || []).slice() }) } catch (e) { /* noop */ }
       if (has) setExpandedIds((prev) => (prev || []).filter((x) => x !== oid))
       else {
-        setExpandedIds((prev) => [...(prev || []), oid])
+        setExpandedIds((prev) => ((prev || []).indexOf(oid) >= 0 ? prev : [...(prev || []), oid]))
         zCounter.current += 1
         const z = zCounter.current
         setZMap((prev) => ({ ...(prev || {}), [oid]: z }))
         setSelAgent(null)
       }
-      // FIX v0.5.1: niente kick a 30ms (misurerebbe la width a meta transition);
-      // il kick singolo con size finali lo fa l'effetto motore su expandedKey.
+      // niente kick qui (misurerebbe la width a meta transition);
+      // il push-out singolo con size finali lo fa l'effetto motore su expandedKey.
     } catch (e) { /* toggle mai fatale */ }
   }
   const collapse = (oid) => {
     try {
+      try { gestLog('toggle-expand', { id: oid, to: 'collapse', before: (expandedIds || []).slice() }) } catch (e) { /* noop */ }
       setExpandedIds((prev) => (prev || []).filter((x) => x !== oid))
-      // FIX v0.5.1: come sopra, kick solo dall'effetto motore su expandedKey.
     } catch (e) { /* noop */ }
+  }
+  /* Debug runtime v0.5.2: bottone 'Debug: copia log' solo se attivo
+   * (localStorage 'gest-debug'='1'). Poll leggero per cambio live. */
+  const [gestDbg, setGestDbg] = useState(false)
+  useEffect(() => {
+    let alive = true
+    const chk = () => { try { if (alive) setGestDbg(gestDebugOn()) } catch (e) { /* noop */ } }
+    chk()
+    const t = setInterval(chk, 1500)
+    return () => { alive = false; try { clearInterval(t) } catch (e) { /* noop */ } }
+  }, [])
+  const copyGestLog = () => {
+    try {
+      const txt = (typeof window !== 'undefined' && window.__GEST_DEBUG__ && window.__GEST_DEBUG__.dump) ? window.__GEST_DEBUG__.dump() : '[]'
+      if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(txt).then(() => {
+          try { gestLog('debug-copied', { chars: txt.length }) } catch (e) { /* noop */ }
+        }).catch(() => { /* clipboard negata: il dump resta in console */ })
+      }
+      try { console.log('[gest] dump-chars', txt.length) } catch (e) { /* noop */ }
+    } catch (e) { /* copia mai fatale */ }
   }
 
   useEffect(() => {
+    // v0.5.2: fetch detail per-id indipendente — ogni card espansa carica il
+    // suo; errore (es. 404) => {_missing:true} ma la section base con activity
+    // resta sempre visibile, mai card vuota che sembra 'rotta'.
     const missing = (expandedIds || []).filter((id) => !(details && details[id]))
     if (!missing.length) return undefined
     let alive = true
     missing.forEach((id) => {
-      api('/offices/' + encodeURIComponent(id) + '/detail' + q)
+      const p = '/offices/' + encodeURIComponent(id) + '/detail' + q
+      api(p)
         .then((d) => { if (alive) setDetails((prev) => ({ ...(prev || {}), [id]: d })) })
-        .catch(() => { if (alive) setDetails((prev) => ({ ...(prev || {}), [id]: { _missing: true } })) })
+        .catch((e) => {
+          try { gestLog('detail-fetch-err', { id: id, path: p, status: String((e && (e.message || e)) || 'err') }) } catch (e2) { /* noop */ }
+          if (alive) setDetails((prev) => ({ ...(prev || {}), [id]: { _missing: true } }))
+        })
     })
     return () => { alive = false }
   }, [expandedKey, q])
@@ -901,9 +1101,9 @@ function UfficiTab(props) {
   const edgesSig = (edges || []).map((e) => e.a + '|' + e.b).join(',')
   const dataSig = (agents || []).length + ':' + (chats || []).reduce((n, c) => n + (((c && c.messages) || []).length), 0) + ':' + (((tasksData && tasksData.tasks) || []).length)
   useEffect(() => {
-    try { layout.kick() } catch (e) { /* motore non pronto */ }
-    // FIX v0.5.1: expandedKey gestito SOLO dall'effetto motore (singola
-    // passata con size finali a toggle) — qui solo cambi dati reali.
+    try { layout.kick({ reason: 'data' }) } catch (e) { /* motore non pronto */ }
+    // v0.5.2: expandedKey gestito SOLO dall'effetto motore (push-out forte a
+    // toggle) — qui solo cambi dati reali, passata gentle.
   }, [edgesSig, activeSig, dataSig, details])
 
   const openChat = (c, wantOpen) => {
@@ -1065,6 +1265,7 @@ function UfficiTab(props) {
               ],
             }),
             det && !det._missing && det.goal ? jsx('div', { key: 'g', className: 'text-[0.68rem] text-(--ui-text-secondary) leading-snug break-words', children: String(det.goal).slice(0, 500) }) : null,
+            !det ? jsx('div', { key: 'dl', className: 'text-[0.62rem] text-(--ui-text-quaternary)', children: 'Dettaglio server in caricamento… (base qui sotto sempre visibile)' }) : null,
             jsxs('div', {
               key: 'ch', className: 'flex flex-col gap-1',
               children: [
@@ -1234,6 +1435,15 @@ function UfficiTab(props) {
           }),
         ],
       }),
+      /* Debug runtime v0.5.2: bottone visibile SOLO a debug attivo --------- */
+      gestDbg ? jsx('div', {
+        key: 'dbg', className: 'flex justify-end shrink-0',
+        children: jsx(Button, {
+          size: 'sm', variant: 'ghost', type: 'button',
+          title: 'Log debug gestionale — attivo via localStorage gest-debug=1. DevTools: Ctrl+Shift+I, tab Console; oppure lancia window.__GEST_DEBUG__.dump()',
+          onClick: copyGestLog, children: 'Debug: copia log',
+        }),
+      }) : null,
       /* Bottom: worker force-directed ---------------------------------------- */
       jsx('div', {
         key: 'area', ref: layout.areaEl, className: 'relative flex-1 min-h-[440px] rounded-md border border-(--ui-stroke-primary)',

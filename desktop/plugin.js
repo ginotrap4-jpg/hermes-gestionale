@@ -1,4 +1,4 @@
-/** Gestionale Hermes — desktop plugin v0.5.3.
+/** Gestionale Hermes — desktop plugin v0.5.3 (build v0.5.4).
  * Sidebar /gestionale con tab: Uffici (top row Orchestratore + Knowledge Keeper,
  * worker force-directed con card rettangolari, glifi, mini-task, elbow lines),
  * Chat, Automazioni (last_run_at + Esegui ora + Log), Output (file explorer),
@@ -72,9 +72,13 @@ const TABS = [['uffici', 'Uffici'], ['chat', 'Chat'], ['automazioni', 'Automazio
 const DEBUG_GEST = false
 function gestDebugOn() {
   try {
-    if (typeof localStorage !== 'undefined' && localStorage.getItem('gest-debug') === '1') return true
+    if (typeof localStorage !== 'undefined') {
+      const v = localStorage.getItem('gest-debug')
+      if (v === '0') return false
+      if (v === '1') return true
+    }
   } catch (e) { /* storage non disponibile */ }
-  return DEBUG_GEST
+  return true // v0.5.4: debug di default ACCESO (log sempre disponibile)
 }
 function gestLog(msg, data) {
   try {
@@ -112,6 +116,14 @@ try {
     }
   }
 } catch (e) { /* setup debug mai fatale */ }
+try {
+  window.addEventListener('error', (ev) => {
+    try { gestLog('window-error', { msg: (ev && (ev.message || String(ev))) || '?', file: (ev && ev.filename) || '', line: (ev && ev.lineno) || 0 }) } catch (e2) { /* noop */ }
+  })
+  window.addEventListener('unhandledrejection', (ev) => {
+    try { gestLog('unhandled-rejection', { msg: (ev && ev.reason && (ev.reason.message || String(ev.reason))) || '?' }) } catch (e2) { /* noop */ }
+  })
+} catch (e) { /* noop */ }
 
 async function api(path, opts) {
   try {
@@ -2145,6 +2157,7 @@ function GestionalePage() {
         key: 'head', className: 'flex items-center gap-2 px-3 py-2 border-b border-(--ui-stroke-primary)',
         children: [
           jsx('span', { key: 't', className: 'text-sm font-semibold', children: 'Gestionale' }),
+          jsx('span', { key: 'ver', className: 'text-[0.6rem] text-(--ui-text-quaternary)', title: 'versione build plugin', children: 'v0.5.4' }),
           jsx(Badge, { key: 'b', variant: 'secondary', children: running + ' agenti attivi' }),
           jsx('span', { key: 's', className: 'ml-auto text-[0.6rem] text-(--ui-text-quaternary)', children: status }),
         ],

@@ -1,5 +1,6 @@
-/** Gestionale Hermes — desktop plugin v0.3.
- * Sidebar /gestionale con tab: Uffici (canvas force-directed monocromatico),
+/** Gestionale Hermes — desktop plugin v0.4.
+ * Sidebar /gestionale con tab: Uffici (top row Orchestratore + Knowledge Keeper,
+ * worker force-directed con card rettangolari, glifi, mini-task, elbow lines),
  * Chat, Automazioni (last_run_at + Esegui ora + Log), Output (file explorer),
  * Progetti (kanban read-only + commenti). Selettore profili in basso (?profile=).
  * Dati: ctx.rest verso /api/plugins/gestionale/ quando disponibile,
@@ -138,480 +139,615 @@ function monoBlue(i, accent) {
   return 'hsl(' + h + ', 58%, ' + l + '%)'
 }
 
-/* Grafo uffici -----------------------------------------------------------
- * Prova GET /graph (nodi con x,y,vx,vy + pesi); se 404, deriva i lati
- * client-side dalle chat ACTIVE (con almeno un messaggio): il peso è il
- * numero di messaggi, e avvicina i nodi collegati.
+/* Tab Uffici v0.4 ------------------------------------------------------------
+ * Top row: Orchestratore (sempre presente) + Knowledge Keeper (fissi in alto,
+ * non partecipano alle forze). Bottom: worker con layout force-directed SOLO
+ * tra loro. Card rettangolari con glifi, agenti in mini-anteprima, mini-task
+ * colorati, linee elbow ortogonali, pulse attive, flash verde su chat interna,
+ * expand in place, popover sessione agente. Fallback sicuri se campi/API
+ * mancano: la UI resta grafica anche con dati vuoti.
  */
-function deriveGraph(offices, agents, chats, graphJson) {
-  const nodes = (offices || []).filter((o) => o && (o.id || o.name)).map((o) => ({ id: o.id || o.name, name: o.name || o.id }))
-  if (graphJson && (graphJson.edges || graphJson.links || graphJson.nodes)) {
-    const seed = {}
-    ;(graphJson.nodes || []).forEach((n) => { seed[n.id] = n })
-    const raw = graphJson.edges || graphJson.links || []
-    const edges = raw.map((e, i) => ({
-      a: e.a || e.source || e.from, b: e.b || e.target || e.to,
-      weight: Number(e.weight || e.messages || 1) || 1,
-      chatId: e.chat_id || e.chatId || null,
-      label: e.label || e.name || '',
-      count: Number(e.messages || e.weight || 0) || 0,
-      key: 'g' + i,
-    })).filter((e) => e.a && e.b)
-    return { nodes, edges, seed }
-  }
-  const officeOf = {}
-  ;(agents || []).forEach((a) => { officeOf[a.id] = a.office_id })
-  const pairCount = {}
-  const pairChat = {}
-  ;(chats || []).forEach((c) => {
-    const msgs = c.messages || []
-    if (!msgs.length) return // solo chat ACTIVE
-    const offs = {}
-    ;(c.participants || []).forEach((pid) => { if (officeOf[pid]) offs[officeOf[pid]] = true })
-    const list = Object.keys(offs)
-    for (let i = 0; i < list.length; i++) {
-      for (let j = i + 1; j < list.length; j++) {
-        const k = list[i] < list[j] ? list[i] + '|' + list[j] : list[j] + '|' + list[i]
-        pairCount[k] = (pairCount[k] || 0) + msgs.length
-        if (!pairChat[k]) pairChat[k] = c
-      }
-    }
-  })
-  const edges = Object.keys(pairCount).map((k, i) => {
-    const parts = k.split('|')
-    const c = pairChat[k] || {}
-    return { a: parts[0], b: parts[1], weight: pairCount[k], chatId: c.id || null, label: c.name || '', count: pairCount[k], key: 'd' + i }
-  })
-  return { nodes, edges, seed: {} }
+const UFF_GREEN = '#4cc38a'
+
+function glyphFor(name) {
+  const n = (typeof name === 'string' ? name : '').toLowerCase()
+  if (/orchestrat/.test(n)) return '⬢'
+  if (/keeper|gatekeeper|knowledge|archiv/.test(n)) return '▣'
+  if (/dev|code|front|back|software|app/.test(n)) return '</>'
+  if (/qa|test|bug|virus|pest/.test(n)) return '☣'
+  if (/research|ricerca|search|studio|insight/.test(n)) return '⚲'
+  if (/design|grafic|ui|ux|brand/.test(n)) return '✎'
+  if (/data|db|database|analytic/.test(n)) return '▤'
+  if (/doc|writ|testi|content|blog/.test(n)) return '☰'
+  if (/ops|deploy|infra|server|sre/.test(n)) return '⚙'
+  if (/market|growth|ads|social|seo/.test(n)) return '◈'
+  if (/support|help|care|client/.test(n)) return '♡'
+  return '○'
 }
 
-/* Canvas force-directed (physics hand-rolled, niente librerie) ------------ */
-function OfficesCanvas({ nodes, edges, seed, selectedId, onNodeClick, onEdgeClick }) {
-  const wrapRef = useRef(null)
-  const canvasRef = useRef(null)
-  const dataRef = useRef({ nodes, edges, seed })
-  dataRef.current = { nodes, edges, seed }
-  const cbRef = useRef({ onNodeClick, onEdgeClick })
-  cbRef.current = { onNodeClick, onEdgeClick }
-  const selRef = useRef(selectedId)
-  selRef.current = selectedId
-
-  useEffect(() => {
-    const wrap = wrapRef.current
-    const canvas = canvasRef.current
-    if (!wrap || !canvas) return undefined
-    const ctx = canvas.getContext('2d')
-    const size = { w: 300, h: 300, dpr: 1 }
-    let colors = { text: '#999', faint: '#777', stroke: '#555', accent: '#7aa2f7', bubble: '#fff', bubbleSub: '#bbb', panel: '#111' }
-    const pos = new Map() // id -> {x,y,vx,vy}
-    let mouse = null
-    let hoverEdge = null
-    let dragId = null
-    let downAt = null
-    let raf = 0
-
-    const resolveColors = () => {
-      try {
-        const cs = getComputedStyle(canvas)
-        const g = (n, fb) => (cs.getPropertyValue(n) || '').trim() || fb
-        colors = {
-          text: g('--ui-text-secondary', g('--foreground', '#999')),
-          faint: g('--ui-text-quaternary', g('--muted-foreground', '#777')),
-          stroke: g('--ui-stroke-secondary', g('--border', '#555')),
-          accent: g('--ui-accent', g('--accent', '#7aa2f7')),
-          bubble: g('--ui-text-primary', g('--foreground', '#fff')),
-          bubbleSub: g('--ui-text-tertiary', g('--muted-foreground', '#bbb')),
-          panel: g('--card', '#111'),
-        }
-      } catch (e) { /* tema non leggibile, fallback ok */ }
-    }
-
-    const ensureSize = () => {
-      const w = wrap.clientWidth
-      const h = wrap.clientHeight
-      if (!w || !h) return
-      const dpr = Math.min(2, window.devicePixelRatio || 1)
-      size.w = w; size.h = h; size.dpr = dpr
-      canvas.width = Math.round(w * dpr)
-      canvas.height = Math.round(h * dpr)
-      canvas.style.width = w + 'px'
-      canvas.style.height = h + 'px'
-      resolveColors()
-    }
-    ensureSize()
-    let ro = null
+/* Keyframes iniettati in document.head una unica volta (via useMemo) -------- */
+function useUfficiStyles() {
+  useMemo(() => {
     try {
-      ro = new ResizeObserver(ensureSize)
-      ro.observe(wrap)
-    } catch (e) { /* ResizeObserver non disponibile: misura fissa */ }
+      if (typeof document === 'undefined') return null
+      if (document.getElementById('uffici-v4-style')) return null
+      const st = document.createElement('style')
+      st.id = 'uffici-v4-style'
+      st.textContent =
+        '@keyframes uffPulse{0%,100%{box-shadow:0 0 0 0 transparent}50%{box-shadow:0 0 10px 0 var(--accent)}}' +
+        '@keyframes uffGreenFlash{0%,100%{box-shadow:0 0 0 0 transparent}50%{box-shadow:0 0 12px 0 var(--ui-success,#4cc38a)}}' +
+        '@keyframes uffDash{to{stroke-dashoffset:-14}}' +
+        '.uff-active{animation:uffPulse 2.4s ease-in-out infinite}' +
+        '.uff-flash{animation:uffGreenFlash 1.1s ease-in-out infinite}' +
+        '.uff-chatline{stroke-dasharray:6 4;animation:uffDash 1.2s linear infinite}' +
+        '.uff-card{transition:width .25s ease,border-color .2s ease,box-shadow .2s ease}'
+      document.head.appendChild(st)
+      return null
+    } catch (e) { return null }
+  }, [])
+}
 
-    const P = (id) => {
-      let p = pos.get(id)
-      if (!p) {
-        const s = (dataRef.current.seed || {})[id] || {}
-        const n = pos.size
-        p = {
-          x: typeof s.x === 'number' ? s.x : size.w / 2 + 90 * Math.cos((n * 2.4) + 0.5),
-          y: typeof s.y === 'number' ? s.y : size.h / 2 + 90 * Math.sin((n * 2.4) + 0.5),
-          vx: typeof s.vx === 'number' ? s.vx : 0,
-          vy: typeof s.vy === 'number' ? s.vy : 0,
-        }
-        pos.set(id, p)
+function kindOf(o) {
+  const k = (o && o.kind) || ''
+  if (k === 'orchestrator' || k === 'gatekeeper' || k === 'worker') return k
+  const n = ((o && (o.name || o.id)) || '').toLowerCase()
+  if (/orchestrat/.test(n)) return 'orchestrator'
+  if (/keeper|gatekeeper|knowledge/.test(n)) return 'gatekeeper'
+  return 'worker'
+}
+
+function agentsOf(office, allAgents) {
+  if (office && Array.isArray(office.agents) && office.agents.length) return office.agents
+  const id = office && (office.id || office.name)
+  return (allAgents || []).filter((a) => a && (a.office_id === id || a.office === id))
+}
+
+function msgTs(m) {
+  let t = Number((m && (m.ts || m.timestamp || m.created_at)) || 0) || 0
+  if (t > 1e12) t = t / 1000
+  return t
+}
+
+/* Layout force-directed in spazio normalizzato 0..100 (solo worker) --------- */
+function useWorkerLayout(ids, edges) {
+  const posRef = useRef({})
+  const [, setVer] = useState(0)
+  const idsKey = (ids || []).join(',')
+  const edgesKey = (edges || []).map((e) => e.a + '|' + e.b + ':' + (e.active ? 1 : 0) + ':' + e.weight).join(',')
+  useEffect(() => {
+    const p = posRef.current
+    ;(ids || []).forEach((id, i) => {
+      if (!p[id]) {
+        p[id] = { x: 10 + 80 * (((i + 1) * 0.61803) % 1), y: 16 + 68 * (((i + 1) * 0.38197) % 1), vx: 0, vy: 0 }
       }
-      return p
-    }
-
-    const distToSeg = (mx, my, ax, ay, bx, by) => {
-      const dx = bx - ax
-      const dy = by - ay
-      const len2 = dx * dx + dy * dy || 1
-      let t = ((mx - ax) * dx + (my - ay) * dy) / len2
-      t = Math.max(0, Math.min(1, t))
-      const px = ax + t * dx
-      const py = ay + t * dy
-      return Math.sqrt((mx - px) * (mx - px) + (my - py) * (my - py))
-    }
-
-    const step = () => {
-      const cur = dataRef.current
-      const list = cur.nodes || []
-      const links = cur.edges || []
-      list.forEach((n) => P(n.id))
-      // repulsione tra nodi
+    })
+    Object.keys(p).forEach((k) => { if ((ids || []).indexOf(k) < 0) delete p[k] })
+  }, [idsKey])
+  useEffect(() => {
+    if (!(ids || []).length) return undefined
+    let alive = true
+    let timer = 0
+    const edgeList = edges || []
+    const linked = {}
+    edgeList.forEach((e) => { linked[e.a + '|' + e.b] = e; linked[e.b + '|' + e.a] = e })
+    const stepOnce = () => {
+      if (!alive) return
+      const p = posRef.current
+      const list = ids || []
       for (let i = 0; i < list.length; i++) {
-        const a = P(list[i].id)
+        const A = p[list[i]]
+        if (!A) continue
         for (let j = i + 1; j < list.length; j++) {
-          const b = P(list[j].id)
-          let dx = a.x - b.x
-          let dy = a.y - b.y
+          const B = p[list[j]]
+          if (!B) continue
+          const e = linked[list[i] + '|' + list[j]]
+          let dx = A.x - B.x
+          let dy = A.y - B.y
           let d2 = dx * dx + dy * dy
-          if (d2 < 1) { dx = Math.random() - 0.5; dy = Math.random() - 0.5; d2 = 1 }
-          const d = Math.sqrt(d2)
-          const f = Math.min(6, 2600 / d2)
+          if (d2 < 0.5) { dx = (i - j) || 0.5; dy = (i % 2 ? 1 : -1) * 0.5; d2 = dx * dx + dy * dy }
+          const d = Math.sqrt(d2) || 1
+          const rep = e ? 26 : 90 // non comunicano -> repulsione maggiore, distanza massima
+          const f = Math.min(4, rep / d2)
           const ux = (dx / d) * f
           const uy = (dy / d) * f
-          a.vx += ux; a.vy += uy; b.vx -= ux; b.vy -= uy
+          A.vx += ux; A.vy += uy; B.vx -= ux; B.vy -= uy
         }
       }
-      // molle sui lati: il peso avvicina (rest più corta, molla più forte)
-      links.forEach((e) => {
-        if (!pos.has(e.a) || !pos.has(e.b)) return
-        const a = pos.get(e.a)
-        const b = pos.get(e.b)
-        const w = Math.min(40, Number(e.weight) || 1)
-        const rest = Math.max(70, 200 - w * 4)
-        const k = 0.012 * (1 + w * 0.12)
-        const dx = b.x - a.x
-        const dy = b.y - a.y
+      edgeList.forEach((e) => {
+        if (!e.active) return // chat closed -> forza rilasciata
+        const A = p[e.a]
+        const B = p[e.b]
+        if (!A || !B) return
+        const w = Math.min(30, Number(e.weight) || 1)
+        const rest = Math.max(14, 44 - w * 1.1)
+        const k = 0.02 * (1 + w * 0.15) // attrazione proporzionale al peso live
+        const dx = B.x - A.x
+        const dy = B.y - A.y
         const d = Math.sqrt(dx * dx + dy * dy) || 1
         const f = (d - rest) * k
         const ux = (dx / d) * f
         const uy = (dy / d) * f
-        a.vx += ux; a.vy += uy; b.vx -= ux; b.vy -= uy
+        A.vx += ux; A.vy += uy; B.vx -= ux; B.vy -= uy
       })
-      // centraggio + attrito; il nodo trascinato resta fermo
-      const cx = size.w / 2
-      const cy = size.h / 2
-      pos.forEach((p, id) => {
-        if (id === dragId) { p.vx = 0; p.vy = 0; return }
-        p.vx += (cx - p.x) * 0.006
-        p.vy += (cy - p.y) * 0.006
-        p.vx *= 0.86; p.vy *= 0.86
-        const sp = Math.sqrt(p.vx * p.vx + p.vy * p.vy)
-        if (sp > 8) { p.vx = (p.vx / sp) * 8; p.vy = (p.vy / sp) * 8 }
-        p.x += p.vx; p.y += p.vy
+      list.forEach((id) => {
+        const P = p[id]
+        if (!P) return
+        P.vx += (50 - P.x) * 0.004
+        P.vy += (52 - P.y) * 0.004
+        P.vx *= 0.88; P.vy *= 0.88
+        P.x = Math.min(94, Math.max(4, P.x + P.vx))
+        P.y = Math.min(90, Math.max(8, P.y + P.vy))
       })
+      setVer((v) => v + 1)
+      timer = setTimeout(stepOnce, 90)
     }
-
-    const roundRect = (x, y, w, h, r) => {
-      ctx.beginPath()
-      ctx.moveTo(x + r, y)
-      ctx.arcTo(x + w, y, x + w, y + h, r)
-      ctx.arcTo(x + w, y + h, x, y + h, r)
-      ctx.arcTo(x, y + h, x, y, r)
-      ctx.arcTo(x, y, x + w, y, r)
-      ctx.closePath()
-    }
-
-    const draw = () => {
-      const cur = dataRef.current
-      ctx.setTransform(size.dpr, 0, 0, size.dpr, 0, 0)
-      ctx.clearRect(0, 0, size.w, size.h) // sfondo trasparente (nessun fill)
-      // lati: grigio/blu tenue, opacità ~.4, spessore = peso messaggi
-      ;(cur.edges || []).forEach((e) => {
-        if (!pos.has(e.a) || !pos.has(e.b)) return
-        const a = pos.get(e.a)
-        const b = pos.get(e.b)
-        const hot = hoverEdge && hoverEdge.key === e.key
-        ctx.save()
-        ctx.globalAlpha = hot ? 0.9 : 0.4
-        ctx.beginPath()
-        ctx.moveTo(a.x, a.y)
-        ctx.lineTo(b.x, b.y)
-        ctx.strokeStyle = hot ? colors.accent : colors.stroke
-        ctx.lineWidth = hot ? 3 : 1 + Math.min(4, (Number(e.weight) || Number(e.count) || 1) / 6)
-        ctx.stroke()
-        ctx.restore()
-        if (hot) {
-          const mx = (a.x + b.x) / 2
-          const my = (a.y + b.y) / 2
-          const title = e.label || (e.a + ' ↔ ' + e.b)
-          const sub = (e.count || e.weight || 0) + ' messaggi — clicca per aprire la chat'
-          ctx.font = '11px sans-serif'
-          const w1 = ctx.measureText(title).width
-          ctx.font = '10px sans-serif'
-          const w2 = ctx.measureText(sub).width
-          const bw = Math.max(w1, w2) + 16
-          const bx = Math.min(Math.max(4, mx - bw / 2), Math.max(4, size.w - bw - 4))
-          const by = Math.max(4, my - 46)
-          roundRect(bx, by, bw, 40, 6)
-          ctx.fillStyle = colors.panel
-          ctx.fill()
-          ctx.strokeStyle = colors.accent
-          ctx.lineWidth = 1
-          ctx.stroke()
-          ctx.fillStyle = colors.bubble
-          ctx.font = '11px sans-serif'
-          ctx.fillText(title, bx + 8, by + 16)
-          ctx.fillStyle = colors.bubbleSub
-          ctx.font = '10px sans-serif'
-          ctx.fillText(sub, bx + 8, by + 31)
-        }
-      })
-      // nodi: palette monocromatica Hermes (toni di blu da --accent)
-      ;(cur.nodes || []).forEach((n, idx) => {
-        const p = P(n.id)
-        const R = 24
-        ctx.beginPath()
-        ctx.arc(p.x, p.y, R, 0, Math.PI * 2)
-        ctx.fillStyle = monoBlue(idx, colors.accent)
-        ctx.fill()
-        ctx.beginPath()
-        ctx.arc(p.x, p.y, R, 0, Math.PI * 2)
-        ctx.strokeStyle = colors.stroke
-        ctx.lineWidth = 1
-        ctx.stroke()
-        if (selRef.current === n.id) {
-          ctx.beginPath()
-          ctx.arc(p.x, p.y, R + 4, 0, Math.PI * 2)
-          ctx.strokeStyle = colors.accent
-          ctx.lineWidth = 2.5
-          ctx.stroke()
-        }
-        ctx.fillStyle = colors.text
-        ctx.font = '11px sans-serif'
-        ctx.textAlign = 'center'
-        ctx.fillText(n.name || n.id || '', p.x, p.y + R + 14)
-        ctx.textAlign = 'left'
-      })
-    }
-
-    const frame = () => {
-      step()
-      draw()
-      raf = requestAnimationFrame(frame)
-    }
-    raf = requestAnimationFrame(frame)
-
-    const toLocal = (ev) => {
-      const r = canvas.getBoundingClientRect()
-      return { x: ev.clientX - r.left, y: ev.clientY - r.top }
-    }
-    const hitNode = (m) => {
-      const cur = dataRef.current
-      const list = cur.nodes || []
-      for (let i = list.length - 1; i >= 0; i--) {
-        const p = pos.get(list[i].id)
-        if (!p) continue
-        if ((m.x - p.x) * (m.x - p.x) + (m.y - p.y) * (m.y - p.y) <= 26 * 26) return list[i].id
-      }
-      return null
-    }
-    const hitEdge = (m) => {
-      const cur = dataRef.current
-      let best = null
-      let bestD = 9
-      ;(cur.edges || []).forEach((e) => {
-        if (!pos.has(e.a) || !pos.has(e.b)) return
-        const a = pos.get(e.a)
-        const b = pos.get(e.b)
-        const d = distToSeg(m.x, m.y, a.x, a.y, b.x, b.y)
-        if (d < bestD) { bestD = d; best = e }
-      })
-      return best
-    }
-
-    const onDown = (ev) => {
-      const m = toLocal(ev)
-      const id = hitNode(m)
-      downAt = m
-      if (id) {
-        dragId = id
-        const p = P(id)
-        p.x = m.x; p.y = m.y
-      }
-    }
-    const onMove = (ev) => {
-      const m = toLocal(ev)
-      mouse = m
-      if (dragId && downAt) {
-        const p = P(dragId)
-        p.x = m.x; p.y = m.y
-        return
-      }
-      hoverEdge = hitEdge(m)
-      canvas.style.cursor = hitNode(m) || hoverEdge ? 'pointer' : 'default'
-    }
-    const onUp = (ev) => {
-      const m = toLocal(ev)
-      const moved = downAt ? Math.abs(m.x - downAt.x) + Math.abs(m.y - downAt.y) : 99
-      const wasDrag = dragId
-      dragId = null
-      downAt = null
-      if (moved > 4) return // era un trascinamento, non un clic
-      const id = hitNode(m)
-      if (id) { cbRef.current.onNodeClick(id); return }
-      if (wasDrag) return
-      const e = hitEdge(m)
-      if (e) cbRef.current.onEdgeClick(e)
-      else { cbRef.current.onNodeClick(null); cbRef.current.onEdgeClick(null) }
-    }
-    const onLeave = () => { hoverEdge = null; mouse = null; if (!dragId) downAt = null }
-
-    canvas.addEventListener('mousedown', onDown)
-    window.addEventListener('mousemove', onMove)
-    window.addEventListener('mouseup', onUp)
-    canvas.addEventListener('mouseleave', onLeave)
-    return () => {
-      cancelAnimationFrame(raf)
-      if (ro) ro.disconnect()
-      canvas.removeEventListener('mousedown', onDown)
-      window.removeEventListener('mousemove', onMove)
-      window.removeEventListener('mouseup', onUp)
-      canvas.removeEventListener('mouseleave', onLeave)
-    }
-  }, [])
-
-  return jsx('div', {
-    ref: wrapRef,
-    className: 'relative flex-1 min-h-[380px]',
-    children: jsx('canvas', { ref: canvasRef, className: 'absolute inset-0 block' }),
-  })
+    timer = setTimeout(stepOnce, 90)
+    return () => { alive = false; clearTimeout(timer) }
+  }, [idsKey, edgesKey])
+  return posRef.current
 }
 
-function AgentLine({ agent }) {
-  const a = (agent && typeof agent === 'object') ? agent : {}
-  const pct = pctOf(a.progress)
+/* Segmento elbow ortogonale: solo tratti orizzontali + verticali ----------- */
+function elbow(x1, y1, x2, y2) {
+  const mid = ((y1 + y2) / 2).toFixed(1)
+  return 'M ' + x1.toFixed(1) + ' ' + y1.toFixed(1) + ' V ' + mid + ' H ' + x2.toFixed(1) + ' V ' + y2.toFixed(1)
+}
+
+function officeHead(o, st) {
   return jsxs('div', {
-    className: 'rounded-md border border-(--ui-stroke-secondary) p-2 flex flex-col gap-1',
+    key: 'h', className: 'flex items-center gap-1.5',
     children: [
-      jsxs('div', {
-        key: 'h', className: 'flex items-center gap-1.5',
-        children: [
-          jsx(StatusDot, { key: 'd', state: dotFor(a.state) }),
-          jsx('span', { key: 'n', className: 'text-xs font-medium truncate', children: a.name || a.id || '—' }),
-          jsx('span', { key: 's', className: 'ml-auto text-[0.6rem] text-(--ui-text-quaternary)', children: a.state || '' }),
-        ],
+      jsx('span', {
+        key: 'g',
+        className: 'inline-flex items-center justify-center rounded-full shrink-0',
+        style: {
+          width: 22, height: 22, background: 'transparent', fontSize: 11,
+          border: '1px solid var(--border, var(--ui-stroke-secondary))',
+          color: 'var(--muted-foreground, var(--ui-text-tertiary))',
+        },
+        children: glyphFor((o && (o.name || o.id)) || ''),
       }),
-      jsx('div', {
-        key: 'bar', className: 'h-1 rounded-full bg-(--ui-stroke-secondary) overflow-hidden',
-        children: jsx('div', { className: 'h-full bg-(--ui-accent)', style: { width: pct + '%' } }),
-      }),
-      jsx('div', {
-        key: 'act', className: 'text-[0.6875rem] text-(--ui-text-tertiary) leading-snug',
-        children: (a.goal || 'in attesa di mansione') + ' · ' + pct + '% · ' + fmtAgo(a.heartbeat_at || a.started_at),
-      }),
+      jsx('span', { key: 'n', className: 'text-xs font-medium truncate flex-1', children: (o && (o.name || o.id)) || '—' }),
+      jsx(StatusDot, { key: 'd', state: st.flash ? 'online' : (st.active ? 'online' : 'idle') }),
     ],
   })
 }
 
-function UfficiTab({ offices, agents, chats, graphJson }) {
+function agentMini(a, onPick) {
+  const m = (a && typeof a === 'object') ? a : {}
+  const model = m.model || m.llm || m.engine || ''
+  const firstOut = ((m.last_output || m.output || '').split ? (m.last_output || m.output || '').split('\n')[0] : '')
+  const rawPrev = m.activity || m.goal || m.current_task || m.task || firstOut || 'in attesa di mansione'
+  return jsxs('button', {
+    key: m.id || m.name, type: 'button',
+    onClick: (ev) => { ev.stopPropagation(); if (onPick) onPick(m) },
+    className: 'w-full text-left rounded-md px-1.5 py-1 hover:bg-(--chrome-action-hover) transition-colors flex flex-col gap-px',
+    children: [
+      jsxs('div', {
+        key: 'r', className: 'flex items-baseline gap-1.5',
+        children: [
+          jsx('span', { key: 'n', className: 'text-[0.72rem] font-medium truncate', children: m.name || m.id || '—' }),
+          model ? jsx('span', { key: 'mo', className: 'ml-auto text-[0.6rem] text-(--ui-text-quaternary) truncate shrink-0', children: String(model).slice(0, 18) }) : null,
+        ],
+      }),
+      jsx('div', { key: 'p', className: 'text-[0.65rem] text-(--ui-text-tertiary) truncate', children: String(rawPrev || '').slice(0, 80) }),
+    ],
+  })
+}
+
+function taskMini(t) {
+  const m = (t && typeof t === 'object') ? t : {}
+  const color = m.color || 'var(--accent, var(--ui-accent))'
+  const prev = m.preview || m.description || m.status || ''
+  return jsxs('div', {
+    key: m.id || m.title, className: 'rounded px-1.5 py-1 border border-(--ui-stroke-secondary)',
+    style: { borderLeft: '3px solid ' + color },
+    children: [
+      jsx('div', { key: 't', className: 'text-[0.68rem] font-medium truncate', children: m.title || m.id || '—' }),
+      prev ? jsx('div', { key: 'p', className: 'text-[0.62rem] text-(--ui-text-tertiary) truncate', children: String(prev).slice(0, 70) }) : null,
+    ],
+  })
+}
+
+function agentByIdSafe(allAgents, m) {
+  try {
+    const pid = m && m.from_agent_id
+    const found = (allAgents || []).find((a) => a && a.id === pid)
+    return (found && found.name) || pid || '—'
+  } catch (e) { return '—' }
+}
+
+function UfficiTab(props) {
+  useUfficiStyles()
+  const offices = (props && props.offices) || []
+  const agents = (props && props.agents) || []
+  const chats = (props && props.chats) || []
+  const tasksData = (props && props.tasksData) || null
+  const orchRaw = (props && props.orchData) || null
+  const keeperRaw = (props && props.keeperData) || null
+  const profile = (props && props.profile) || 'default'
   const [selOffice, setSelOffice] = useState(null)
-  const [edgeSel, setEdgeSel] = useState(null) // {a,b,...}
-  const graph = useMemo(
-    () => deriveGraph(offices, agents, chats, graphJson),
-    [offices, agents, chats, graphJson]
-  )
-  const byId = useMemo(() => {
+  const [selAgent, setSelAgent] = useState(null) // {officeId, agentId}
+  const [orchOpen, setOrchOpen] = useState(false)
+  const [keeperOpen, setKeeperOpen] = useState(false)
+  const [details, setDetails] = useState({})
+  const q = '?profile=' + encodeURIComponent(profile)
+
+  const list = Array.isArray(offices) ? offices.filter((o) => o && (o.id || o.name)) : []
+  const orchOffice = list.find((o) => kindOf(o) === 'orchestrator') || null
+  const keeperOffice = list.find((o) => kindOf(o) === 'gatekeeper') || null
+  const workers = list.filter((o) => kindOf(o) === 'worker')
+  const orch = orchOffice || { id: 'orchestrator', name: 'Orchestratore' }
+  const orchId = orch.id || orch.name || 'orchestrator'
+
+  const agentOffice = useMemo(() => {
     const m = {}
-    ;(agents || []).forEach((a) => { m[a.id] = a })
+    ;(agents || []).forEach((a) => { if (a && a.id) m[a.id] = a.office_id || a.office || null })
     return m
   }, [agents])
-  const officeById = useMemo(() => {
+
+  const info = useMemo(() => {
     const m = {}
-    ;(offices || []).forEach((o) => { m[o.id] = o })
-    return m
-  }, [offices])
-
-  const officeAgents = selOffice ? (agents || []).filter((a) => a.office_id === selOffice) : []
-  const edgeChats = useMemo(() => {
-    if (!edgeSel) return []
-    const officeOf = (pid) => byId[pid] && byId[pid].office_id
-    return (chats || []).filter((c) => {
-      const offs = {}
-      ;(c.participants || []).forEach((pid) => { if (officeOf(pid)) offs[officeOf(pid)] = true })
-      return offs[edgeSel.a] && offs[edgeSel.b]
+    const allAgents = agents || []
+    const allChats = chats || []
+    const allTasks = (tasksData && tasksData.tasks) || []
+    const now = Date.now() / 1000
+    const targets = workers.slice()
+    if (orchOffice) targets.push(orchOffice)
+    if (keeperOffice) targets.push(keeperOffice)
+    targets.forEach((o) => {
+      const oid = (o && (o.id || o.name)) || ''
+      const ags = agentsOf(o, allAgents)
+      const tids = (o && (o.active_task_ids || o.task_ids)) || null
+      const tks = (allTasks || []).filter((t) => {
+        if (!t || typeof t !== 'object') return false
+        if (Array.isArray(tids) && tids.indexOf(t.id) >= 0) return true
+        return t.office_id === oid || t.office === oid
+      })
+      const idset = {}
+      ags.forEach((a) => { if (a && a.id) idset[a.id] = true })
+      const lch = (allChats || []).filter((c) => ((c && c.participants) || []).some((pid) => idset[pid]))
+      let live = false
+      lch.forEach((c) => {
+        const msgs = (c && c.messages) || []
+        if (!msgs.length) return
+        if ((now - msgTs(msgs[msgs.length - 1])) < 10) live = true
+      })
+      const flash = Boolean((o && (o.bench_flash || o.chat_active || o.flash)) || live)
+      const active = ags.length > 0 || (o && o.status === 'active') || flash
+      m[oid] = { agents: ags, tasks: tks, chats: lch, flash, active }
     })
-  }, [edgeSel, chats, byId])
+    return m
+  }, [offices, agents, chats, tasksData])
 
-  const side = edgeSel
-    ? jsxs('div', {
-      key: 'edge', className: 'flex flex-col gap-2',
+  const stOf = (oid) => (info && info[oid]) || { agents: [], tasks: [], chats: [], flash: false, active: false }
+
+  const edges = useMemo(() => {
+    const wids = {}
+    workers.forEach((w) => { wids[w.id || w.name] = true })
+    const pairs = {}
+    const pairChat = {}
+    ;(chats || []).forEach((c) => {
+      const msgs = (c && c.messages) || []
+      if (!msgs.length) return
+      const offs = {}
+      ;((c && c.participants) || []).forEach((pid) => { if (agentOffice[pid] && wids[agentOffice[pid]]) offs[agentOffice[pid]] = true })
+      const l = Object.keys(offs)
+      for (let i = 0; i < l.length; i++) {
+        for (let j = i + 1; j < l.length; j++) {
+          const k = l[i] < l[j] ? l[i] + '|' + l[j] : l[j] + '|' + l[i]
+          pairs[k] = (pairs[k] || 0) + msgs.length
+          if (!pairChat[k]) pairChat[k] = c
+        }
+      }
+    })
+    const now = Date.now() / 1000
+    return Object.keys(pairs).map((k, i) => {
+      const parts = k.split('|')
+      const c = pairChat[k] || {}
+      const msgs = (c && c.messages) || []
+      const live = msgs.length ? ((now - msgTs(msgs[msgs.length - 1])) < 120) : false
+      return { a: parts[0], b: parts[1], weight: pairs[k], chatId: (c && c.id) || null, label: (c && c.name) || '', key: 'e' + i, active: live }
+    })
+  }, [chats, agentOffice, offices])
+
+  const wids = workers.map((w) => w.id || w.name)
+  const pos = useWorkerLayout(wids, edges)
+
+  useEffect(() => {
+    if (!selOffice || (details && details[selOffice])) return undefined
+    let alive = true
+    api('/offices/' + encodeURIComponent(selOffice) + '/detail' + q)
+      .then((d) => { if (alive) setDetails((prev) => ({ ...(prev || {}), [selOffice]: d })) })
+      .catch(() => { if (alive) setDetails((prev) => ({ ...(prev || {}), [selOffice]: { _missing: true } })) })
+    return () => { alive = false }
+  }, [selOffice, q])
+
+  const openChat = (c, wantOpen) => {
+    try {
+      const id = c && c.id
+      if (!id) return
+      api('/chats/' + id + (wantOpen ? '/open' : '/close'), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}),
+      }).catch(() => { /* best-effort, il poll aggiorna */ })
+    } catch (e) { /* mai crash per un toggle chat */ }
+  }
+
+  /* Dati orchestratore (da /orchestrator con fallback all'ufficio) ---------- */
+  const orchD = (orchRaw && (orchRaw.orchestrator || orchRaw.data || orchRaw)) || {}
+  const orchGoal = (orchD && (orchD.goal || orchD.current_goal)) || (orchOffice && orchOffice.goal) || ''
+  const orchSubs = ((orchD && (orchD.subtasks || orchD.steps || orchD.missions)) || [])
+  let orchDone = (orchD && (orchD.done != null ? orchD.done : null))
+  let orchTotal = (orchD && (orchD.total != null ? orchD.total : null))
+  if (orchDone == null || orchTotal == null) {
+    orchTotal = orchSubs.length || null
+    orchDone = orchSubs.filter((s) => s && (s.done || s.status === 'done' || Number(s.progress || 0) >= 1)).length
+  }
+  const orchPct = orchTotal ? Math.min(100, Math.max(0, Math.round((orchDone / orchTotal) * 100))) : 0
+  const orchChats = stOf(orchId).chats
+
+  /* Dati keeper (da /gatekeeper/state con fallback) -------------------------- */
+  const keepD = (keeperRaw && (keeperRaw.gatekeeper || keeperRaw.state || keeperRaw.data || keeperRaw)) || {}
+  const keepRows = []
+  ;['status', 'state', 'files', 'locks', 'indexed', 'last_sync', 'updated_at'].forEach((k) => {
+    if (keepD && keepD[k] !== undefined && keepD[k] !== null && keepD[k] !== '') {
+      keepRows.push({ k, v: typeof keepD[k] === 'object' ? JSON.stringify(keepD[k]).slice(0, 80) : String(keepD[k]).slice(0, 80) })
+    }
+  })
+
+  const cardBase = 'uff-card flex flex-col gap-1.5 p-2 cursor-pointer'
+
+  const renderWorker = (o) => {
+    const oid = o.id || o.name
+    const st = stOf(oid)
+    const p = (pos && pos[oid]) || { x: 50, y: 50 }
+    const expanded = selOffice === oid
+    const ags = st.agents || []
+    const shown = ags.slice(0, 4)
+    const extra = ags.length - shown.length
+    const tks = (st.tasks || []).slice(0, 3)
+    const borderCol = st.flash
+      ? 'var(--ui-success, ' + UFF_GREEN + ')'
+      : (st.active ? 'var(--accent, var(--ui-accent))' : 'var(--border, var(--ui-stroke-secondary))')
+    const det = (details && details[oid]) || null
+    const detMsgs = []
+    try {
+      ;(st.chats || []).forEach((c) => {
+        ;((c && c.messages) || []).slice(-3).forEach((m) => detMsgs.push({ c, m }))
+      })
+    } catch (e) { /* preview chat opzionale */ }
+    return jsx('div', {
+      key: oid,
+      onClick: () => { setSelOffice(expanded ? null : oid); if (!expanded) setSelAgent(null) },
+      className: cardBase + (st.flash ? ' uff-flash' : (st.active ? ' uff-active' : '')) + ' absolute',
+      style: {
+        left: p.x + '%', top: p.y + '%', transform: 'translate(-50%,-50%)',
+        width: expanded ? 300 : 190, zIndex: expanded ? 20 : 10,
+        background: 'var(--card)', color: 'var(--foreground, var(--ui-text-primary))',
+        border: '1px solid ' + borderCol, borderRadius: 10,
+      },
       children: [
-        jsxs('div', {
-          key: 'h', className: 'flex items-center gap-2',
+        officeHead(o, st),
+        shown.length
+          ? jsxs('div', { key: 'ag', className: 'flex flex-col gap-0.5', children: shown.map((a) => agentMini(a, (picked) => setSelAgent({ officeId: oid, agentId: picked.id || picked.name }))) })
+          : jsx('div', { key: 'na', className: 'text-[0.65rem] text-(--ui-text-quaternary)', children: 'Nessun agente attivo' }),
+        extra > 0 ? jsx('div', { key: 'more', className: 'text-[0.62rem] text-(--ui-text-quaternary)', children: '+' + extra + ' altri' }) : null,
+        tks.length ? jsxs('div', { key: 'tk', className: 'flex flex-col gap-1', children: tks.map((t) => taskMini(t)) }) : null,
+        expanded ? jsxs('div', {
+          key: 'x', className: 'flex flex-col gap-1.5 pt-1 border-t border-(--ui-stroke-secondary)',
+          onClick: (ev) => ev.stopPropagation(),
           children: [
-            jsx(Button, { key: 'b', size: 'sm', variant: 'ghost', type: 'button', onClick: () => setEdgeSel(null), children: '←' }),
-            jsx('span', {
-              key: 't', className: 'text-xs font-medium truncate',
-              children: (officeById[edgeSel.a] ? officeById[edgeSel.a].name : edgeSel.a) + ' ↔ ' + (officeById[edgeSel.b] ? officeById[edgeSel.b].name : edgeSel.b),
+            det && !det._missing && det.goal ? jsx('div', { key: 'g', className: 'text-[0.68rem] text-(--ui-text-secondary) leading-snug', children: String(det.goal).slice(0, 200) }) : null,
+            jsxs('div', {
+              key: 'ch', className: 'flex flex-col gap-1',
+              children: [
+                jsx('div', { key: 't', className: 'text-[0.62rem] uppercase tracking-wide text-(--ui-text-quaternary)', children: 'Chat collegate' }),
+                (st.chats || []).length
+                  ? (st.chats || []).slice(0, 4).map((c) => jsxs('div', {
+                    key: (c && c.id) || (c && c.name), className: 'flex items-center gap-1.5',
+                    children: [
+                      jsx('span', { key: 'n', className: 'text-[0.68rem] truncate flex-1', children: (c && c.name) || (c && c.id) || '—' }),
+                      jsx('span', { key: 'c', className: 'text-[0.6rem] text-(--ui-text-quaternary)', children: '' + ((c && c.messages) || []).length }),
+                      jsx(Button, {
+                        key: 'b', size: 'sm', variant: 'ghost', type: 'button',
+                        onClick: () => openChat(c, Boolean(c && (c.open === false || c.closed))),
+                        children: (c && (c.open === false || c.closed)) ? 'Apri' : 'Chiudi',
+                      }),
+                    ],
+                  }))
+                  : jsx('div', { key: 'nc', className: 'text-[0.65rem] text-(--ui-text-quaternary)', children: 'Nessuna chat' }),
+              ],
             }),
+            detMsgs.length ? jsxs('div', {
+              key: 'th', className: 'flex flex-col gap-1 rounded-md border border-(--ui-stroke-secondary) p-1.5',
+              children: [
+                jsx('div', { key: 't', className: 'text-[0.62rem] uppercase tracking-wide text-(--ui-text-quaternary)', children: 'Attività interna' }),
+                ...detMsgs.slice(-3).map((r, i) => jsxs('div', {
+                  key: 'm' + i, children: [
+                    jsx('div', { key: 'w', className: 'text-[0.6rem] text-(--ui-text-quaternary)', children: agentByIdSafe(agents, r.m) }),
+                    jsx('div', { key: 'x', className: 'text-[0.68rem] text-(--ui-text-secondary)', children: String((r.m && r.m.text) || '').slice(0, 120) }),
+                  ],
+                })),
+              ],
+            }) : null,
           ],
-        }),
-        edgeChats.length
-          ? edgeChats.map((c) => jsxs('div', {
-            key: c.id, className: 'rounded-md border border-(--ui-stroke-secondary) p-2 flex flex-col gap-1',
-            children: [
-              jsx('div', { key: 'n', className: 'text-[0.6875rem] uppercase tracking-wide text-(--ui-text-tertiary)', children: c.name }),
-              ...(c.messages || []).slice(-6).map((m) => jsxs('div', {
-                key: m.id || ('' + m.ts + m.from_agent_id),
-                children: [
-                  jsx('div', { key: 'w', className: 'text-[0.6rem] text-(--ui-text-quaternary)', children: agentName(byId, m.from_agent_id) }),
-                  jsx('div', { key: 'x', className: 'text-[0.7rem] text-(--ui-text-secondary)', children: m.text }),
-                ],
-              })),
-            ],
-          }))
-          : jsx(EmptyState, { key: 'e', label: 'Nessuna chat fra questi uffici' }),
+        }) : null,
       ],
     })
-    : selOffice
-      ? jsxs('div', {
-        key: 'off', className: 'flex flex-col gap-2',
-        children: [
-          jsx('div', {
-            key: 'h', className: 'text-[0.6875rem] uppercase tracking-wide text-(--ui-text-tertiary)',
-            children: (officeById[selOffice] ? officeById[selOffice].name : selOffice) + ' · ' + officeAgents.length + ' agenti',
-          }),
-          officeAgents.length
-            ? officeAgents.map((a) => jsx(AgentLine, { key: a.id, agent: a }))
-            : jsx(EmptyState, { key: 'e', label: 'Nessun agente in questo ufficio' }),
-        ],
-      })
-      : jsx('div', {
-        key: 'hint', className: 'text-[0.7rem] text-(--ui-text-quaternary) leading-relaxed',
-        children: 'Trascina i nodi per spostarli. Clicca un ufficio per vedere i suoi agenti, o una linea per aprire la chat fra due uffici.',
-      })
+  }
+
+  /* Popover sessione agente -------------------------------------------------- */
+  const popAgent = selAgent ? (stOf(selAgent.officeId).agents || []).find((a) => a && ((a.id || a.name) === selAgent.agentId)) || null : null
+  const popDet = (selAgent && details && details[selAgent.officeId]) || null
+  const popDetAgents = (popDet && (popDet.agents || popDet.sessions)) || []
+  const popDetA = popDetAgents.find((a) => a && ((a.id || a.name) === (selAgent && selAgent.agentId))) || {}
+  const popOut = (popAgent && (popAgent.last_output || popAgent.output))
+    || (popDetA && (popDetA.last_output || popDetA.output))
+    || (((popDetA && popDetA.lines) || []).length ? popDetA.lines.slice(-3).join('\n') : '')
+    || 'nessun output recente'
+  const popTask = (popAgent && (popAgent.current_task || popAgent.task || popAgent.goal))
+    || (popDetA && (popDetA.current_task || popDetA.task))
+    || ''
+  const popAnchor = selAgent && pos && pos[selAgent.officeId]
+    ? { x: Math.min(86, pos[selAgent.officeId].x + 15), y: Math.min(76, pos[selAgent.officeId].y + 14) }
+    : null
+  const popCard = selAgent && pos && pos[selAgent.officeId]
+    ? { x: pos[selAgent.officeId].x, y: pos[selAgent.officeId].y }
+    : null
 
   return jsxs('div', {
-    className: 'flex h-full gap-2 p-2',
+    className: 'flex h-full flex-col gap-2 p-2 overflow-auto',
     children: [
-      jsx(OfficesCanvas, {
-        key: 'cv', nodes: graph.nodes, edges: graph.edges, seed: graph.seed, selectedId: selOffice,
-        onNodeClick: (id) => { setSelOffice(id); if (id) setEdgeSel(null) },
-        onEdgeClick: (e) => { setEdgeSel(e); if (e) setSelOffice(null) },
+      /* Top row: Orchestratore + Knowledge Keeper (fissi) -------------------- */
+      jsxs('div', {
+        key: 'top', className: 'flex gap-2 shrink-0',
+        children: [
+          jsxs('div', {
+            key: 'orch',
+            onClick: () => setOrchOpen(!orchOpen),
+            className: cardBase + ' flex-1',
+            style: {
+              background: 'var(--card)', borderRadius: 10,
+              border: '1px solid ' + (orchOpen ? 'var(--accent, var(--ui-accent))' : 'var(--border, var(--ui-stroke-secondary))'),
+            },
+            children: [
+              officeHead(orch, { active: true, flash: false }),
+              (!orchGoal && !orchOpen) ? jsx('div', { key: 's', className: 'text-[0.65rem] text-(--ui-text-quaternary)', children: 'Sorveglia gli uffici worker' }) : null,
+              orchOpen ? jsxs('div', {
+                key: 'd', className: 'flex flex-col gap-1.5', onClick: (ev) => ev.stopPropagation(),
+                children: [
+                  jsx('div', { key: 'g', className: 'text-[0.7rem] text-(--ui-text-secondary) leading-snug', children: orchGoal ? String(orchGoal).slice(0, 300) : 'Goal corrente non disponibile' }),
+                  orchTotal ? jsxs('div', {
+                    key: 'p', className: 'flex flex-col gap-1',
+                    children: [
+                      jsx('div', { key: 'l', className: 'text-[0.62rem] text-(--ui-text-tertiary)', children: 'Avanzamento globale: ' + orchDone + '/' + orchTotal + ' (' + orchPct + '%)' }),
+                      jsx('div', {
+                        key: 'bar', className: 'h-1.5 rounded-full bg-(--ui-stroke-secondary) overflow-hidden',
+                        children: jsx('div', { className: 'h-full bg-(--ui-accent)', style: { width: orchPct + '%' } }),
+                      }),
+                      ...(orchSubs || []).slice(0, 5).map((s, i) => jsx('div', {
+                        key: 's' + i, className: 'text-[0.65rem] text-(--ui-text-tertiary) truncate',
+                        children: ((s && (s.done || s.status === 'done')) ? '✓ ' : '· ') + ((s && (s.name || s.title)) || ('Passo ' + (i + 1))),
+                      })),
+                    ],
+                  }) : jsx('div', { key: 'np', className: 'text-[0.65rem] text-(--ui-text-quaternary)', children: 'Nessun sotto-task riportato' }),
+                  jsxs('div', {
+                    key: 'c', className: 'flex flex-col gap-0.5',
+                    children: [
+                      jsx('div', { key: 't', className: 'text-[0.62rem] uppercase tracking-wide text-(--ui-text-quaternary)', children: 'Chat attive con uffici' }),
+                      orchChats.length
+                        ? orchChats.slice(0, 4).map((c) => jsx('div', { key: (c && c.id) || (c && c.name), className: 'text-[0.68rem] text-(--ui-text-secondary) truncate', children: ((c && c.name) || (c && c.id) || '—') + ' · ' + ((c && c.messages) || []).length + ' messaggi' }))
+                        : [jsx('div', { key: 'nc', className: 'text-[0.65rem] text-(--ui-text-quaternary)', children: 'Nessuna chat attiva' })],
+                    ],
+                  }),
+                ],
+              }) : null,
+            ],
+          }),
+          jsxs('div', {
+            key: 'keep',
+            onClick: () => setKeeperOpen(!keeperOpen),
+            className: cardBase + ' w-64',
+            style: {
+              background: 'var(--card)', borderRadius: 10,
+              border: '1px solid ' + (keeperOpen ? 'var(--accent, var(--ui-accent))' : 'var(--border, var(--ui-stroke-secondary))'),
+            },
+            children: [
+              officeHead(keeperOffice || { id: 'keeper', name: 'Knowledge Keeper' }, { active: false, flash: false }),
+              !keeperOpen ? jsx('div', { key: 's', className: 'text-[0.65rem] text-(--ui-text-quaternary)', children: 'Archivio e memoria condivisa' }) : null,
+              keeperOpen ? jsxs('div', {
+                key: 'd', className: 'flex flex-col gap-1', onClick: (ev) => ev.stopPropagation(),
+                children: keepRows.length
+                  ? keepRows.slice(0, 6).map((r) => jsxs('div', {
+                    key: r.k, className: 'flex items-baseline gap-2',
+                    children: [
+                      jsx('span', { key: 'k', className: 'text-[0.62rem] uppercase tracking-wide text-(--ui-text-quaternary)', children: r.k }),
+                      jsx('span', { key: 'v', className: 'text-[0.68rem] text-(--ui-text-secondary) truncate flex-1 text-right', children: r.v }),
+                    ],
+                  }))
+                  : [jsx('div', { key: 'ns', className: 'text-[0.65rem] text-(--ui-text-quaternary)', children: 'Stato non disponibile' })],
+              }) : null,
+            ],
+          }),
+        ],
       }),
-      jsx('div', { key: 'side', className: 'w-64 shrink-0 overflow-auto flex flex-col gap-2', children: side }),
+      /* Bottom: worker force-directed ---------------------------------------- */
+      jsx('div', {
+        key: 'area', className: 'relative flex-1 min-h-[440px] rounded-md border border-(--ui-stroke-primary)',
+        children: [
+          jsx('svg', {
+            key: 'wires', className: 'absolute inset-0 w-full h-full pointer-events-none',
+            viewBox: '0 0 100 100', preserveAspectRatio: 'none',
+            children: [
+              ...(workers || []).filter((w) => stOf(w.id || w.name).active).map((w) => {
+                const p = (pos && pos[w.id || w.name]) || null
+                if (!p) return null
+                return jsx('path', {
+                  key: 'a-' + (w.id || w.name), d: elbow(p.x, Math.max(0.5, p.y - 6), 50, 0.5),
+                  fill: 'none', stroke: 'var(--border, var(--ui-stroke-secondary))', strokeWidth: 1.5,
+                  vectorEffect: 'non-scaling-stroke', opacity: 0.55,
+                })
+              }),
+              ...(edges || []).map((e) => {
+                const A = (pos && pos[e.a]) || null
+                const B = (pos && pos[e.b]) || null
+                if (!A || !B) return null
+                if (e.active) {
+                  return jsx('path', {
+                    key: e.key, d: elbow(A.x, A.y, B.x, B.y), fill: 'none',
+                    className: 'uff-chatline', stroke: 'var(--ui-success, ' + UFF_GREEN + ')',
+                    strokeWidth: 1.8, vectorEffect: 'non-scaling-stroke', opacity: 0.9,
+                  })
+                }
+                return jsx('path', {
+                  key: e.key, d: elbow(A.x, A.y, B.x, B.y), fill: 'none',
+                  stroke: 'var(--border, var(--ui-stroke-secondary))', strokeWidth: 1,
+                  vectorEffect: 'non-scaling-stroke', opacity: 0.25,
+                })
+              }),
+              (popAnchor && popCard) ? jsx('path', {
+                key: 'pop', d: elbow(popCard.x, popCard.y, popAnchor.x, popAnchor.y), fill: 'none',
+                stroke: 'var(--border, var(--ui-stroke-secondary))', strokeWidth: 1.2,
+                vectorEffect: 'non-scaling-stroke', opacity: 0.7,
+              }) : null,
+            ],
+          }),
+          ...(workers || []).map((w) => renderWorker(w)),
+          !(workers || []).length ? jsx('div', {
+            key: 'empty', className: 'absolute inset-0 flex items-center justify-center',
+            children: jsx(EmptyState, { label: 'Nessun ufficio worker' }),
+          }) : null,
+          (selAgent && popAgent && popAnchor) ? jsxs('div', {
+            key: 'pop',
+            className: 'uff-card absolute flex flex-col gap-1 p-2',
+            style: {
+              left: popAnchor.x + '%', top: popAnchor.y + '%', transform: 'translate(-50%,-50%)',
+              width: 240, zIndex: 30, background: 'var(--card)', borderRadius: 10,
+              border: '1px solid var(--accent, var(--ui-accent))',
+            },
+            children: [
+              jsxs('div', {
+                key: 'h', className: 'flex items-center gap-1.5',
+                children: [
+                  jsx(StatusDot, { key: 'd', state: dotFor(popAgent.state) }),
+                  jsx('span', { key: 'n', className: 'text-[0.72rem] font-medium truncate flex-1', children: popAgent.name || popAgent.id || '—' }),
+                  jsx(Button, { key: 'x', size: 'sm', variant: 'ghost', type: 'button', onClick: () => setSelAgent(null), children: '✕' }),
+                ],
+              }),
+              jsx('div', { key: 'mo', className: 'text-[0.6rem] text-(--ui-text-quaternary)', children: (popAgent.model || popAgent.llm || '') + (popAgent.state ? ' · ' + popAgent.state : '') }),
+              jsx('div', { key: 'ac', className: 'text-[0.68rem] text-(--ui-text-secondary) leading-snug', children: String(popAgent.activity || popAgent.goal || 'in attesa di mansione').slice(0, 160) }),
+              popTask ? jsx('div', { key: 'tk', className: 'text-[0.65rem] text-(--ui-text-tertiary)', children: 'Task: ' + String(popTask).slice(0, 120) }) : null,
+              jsxs('div', {
+                key: 'out', className: 'rounded border border-(--ui-stroke-secondary) p-1.5 flex flex-col gap-0.5',
+                children: [
+                  jsx('div', { key: 't', className: 'text-[0.6rem] uppercase tracking-wide text-(--ui-text-quaternary)', children: 'Ultime righe output' }),
+                  jsx('pre', { key: 'p', className: 'text-[0.65rem] text-(--ui-text-secondary) whitespace-pre-wrap break-all max-h-28 overflow-auto', children: String(popOut).slice(0, 600) }),
+                ],
+              }),
+            ],
+          }) : null,
+        ],
+      }),
     ],
   })
 }
@@ -1148,6 +1284,8 @@ function GestionalePage() {
   const chats = usePoll('/chats' + q, 3000)
   const autos = usePoll('/automations' + q, 3000)
   const graph = usePoll('/graph' + q, 2000)
+  const orchPoll = usePoll('/orchestrator' + q, 3000)
+  const keeperPoll = usePoll('/gatekeeper/state' + q, 3000)
   const tasks = usePoll('/tasks' + q, 3000)
   const projects = usePoll('/projects' + q, 3000)
 
@@ -1170,7 +1308,7 @@ function GestionalePage() {
         jsxs('div', { className: 'text-[0.65rem] text-(--ui-text-quaternary) max-w-md text-center break-all', children: ['diagnostica: ', diag] }),
       ] })
     : tab === 'uffici'
-      ? jsx(UfficiTab, { offices: data.offices, agents: data.agents, chats: data.chats, graphJson: graph.data })
+      ? jsx(UfficiTab, { offices: data.offices, agents: data.agents, chats: data.chats, tasksData: tasks.data, orchData: orchPoll.data, keeperData: keeperPoll.data, profile })
       : tab === 'chat'
         ? jsx(ChatTab, { chats: data.chats, agents: data.agents })
         : tab === 'automazioni'

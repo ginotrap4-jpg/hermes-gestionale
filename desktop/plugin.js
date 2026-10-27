@@ -1,4 +1,4 @@
-/** Gestionale Hermes — desktop plugin v0.5.3 (build v0.5.4).
+/** Gestionale Hermes — desktop plugin v0.5.5 (device-pixel snap anti-sgrana).
  * Sidebar /gestionale con tab: Uffici (top row Orchestratore + Knowledge Keeper,
  * worker force-directed con card rettangolari, glifi, mini-task, elbow lines),
  * Chat, Automazioni (last_run_at + Esegui ora + Log), Output (file explorer),
@@ -452,15 +452,23 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
       })
     } catch (e) { /* misura best-effort */ }
   }
+  function devSnap(v) {
+    // allinea al pixel FISICO: a Windows dpr 1.25/1.5 i css-px interi restano frazionari sullo schermo → testo 'granato'
+    try {
+      const d = window.devicePixelRatio || 1
+      if (!d || d === 1) return Math.round(v)
+      return Math.round(v * d) / d
+    } catch (e) { return Math.round(v) }
+  }
   function applyToDom() {
-    // UNICA scrittura DOM: translate3d a px interi + fili elbow in px 1:1
+    // UNICA scrittura DOM: translate3d snap ai device-pixel + fili elbow in px 1:1
     const s = areaSize.current || { w: 800, h: 500 }
     try {
       posRef.current.forEach((P, id) => {
         const el = cardEls.current[id]
         if (!el || !P) return
-        const X = Math.round((P.x / 100) * s.w)
-        const Y = Math.round((P.y / 100) * s.h)
+        const X = devSnap((P.x / 100) * s.w)
+        const Y = devSnap((P.y / 100) * s.h)
         el.style.transform = 'translate3d(' + X + 'px,' + Y + 'px,0) translate(-50%,-50%)'
       })
     } catch (e) { /* dom non pronto */ }
@@ -470,10 +478,10 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
         const A = posRef.current.get(e.a)
         const B = posRef.current.get(e.b)
         if (!path || !A || !B) return
-        const ax = Math.round((A.x / 100) * s.w)
-        const ay = Math.round((A.y / 100) * s.h)
-        const bx = Math.round((B.x / 100) * s.w)
-        const by = Math.round((B.y / 100) * s.h)
+        const ax = devSnap((A.x / 100) * s.w)
+        const ay = devSnap((A.y / 100) * s.h)
+        const bx = devSnap((B.x / 100) * s.w)
+        const by = devSnap((B.y / 100) * s.h)
         path.setAttribute('d', elbowPx(ax, ay, bx, by))
       })
     } catch (e2) { /* fili opzionali */ }
@@ -2157,7 +2165,7 @@ function GestionalePage() {
         key: 'head', className: 'flex items-center gap-2 px-3 py-2 border-b border-(--ui-stroke-primary)',
         children: [
           jsx('span', { key: 't', className: 'text-sm font-semibold', children: 'Gestionale' }),
-          jsx('span', { key: 'ver', className: 'text-[0.6rem] text-(--ui-text-quaternary)', title: 'versione build plugin', children: 'v0.5.4' }),
+          jsx('span', { key: 'ver', className: 'text-[0.6rem] text-(--ui-text-quaternary)', title: 'versione build plugin', children: 'v0.5.5' }),
           jsx(Badge, { key: 'b', variant: 'secondary', children: running + ' agenti attivi' }),
           jsx('span', { key: 's', className: 'ml-auto text-[0.6rem] text-(--ui-text-quaternary)', children: status }),
         ],

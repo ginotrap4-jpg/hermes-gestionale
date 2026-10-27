@@ -1,4 +1,4 @@
-/** Gestionale Hermes — desktop plugin v0.4.1.
+/** Gestionale Hermes — desktop plugin v0.4.2.
  * Sidebar /gestionale con tab: Uffici (top row Orchestratore + Knowledge Keeper,
  * worker force-directed con card rettangolari, glifi, mini-task, elbow lines),
  * Chat, Automazioni (last_run_at + Esegui ora + Log), Output (file explorer),
@@ -7,6 +7,12 @@
  * fallback a fetch http://127.0.0.1:8790 + polling (3s, 2s per il grafo).
  * Robusto a backend offline (EmptyState). Stile: solo variabili tema,
  * mai colori hardcoded (canvas: toni di blu derivati da --accent).
+ * v0.4.2: (1) icone ufficiali SDK: officeHead usa <Codicon name> via
+ * iconFor() (mapping per ufficio), fallback a glyphFor unicode se Codicon
+ * non disponibile; cerchietti restano trasparenti con bordo. (2) sezione
+ * task in card: SOLO task dell'ufficio con status in_progress/blocked
+ * (i t-ges* sono task reali, non mock); altrimenti riga
+ * '— Task: niente in esecuzione ora'. Board completo in tab Progetti.
  * v0.4.1: (1) zero collegamenti fantasma — linee solo se chat live <5min o
  * flag backend, mai fallback tenue; stub orchestratore solo se agenti presenti.
  * (2) card espansa opaca + shadow + anti-overlap con misure DOM (adiacenti si
@@ -15,7 +21,7 @@
  * sessione click-only ancorato alla card: nome, modello, activity (ultima
  * riga), task corrente, ultime righe output.
  */
-import { cn, host, Button, Badge, EmptyState, StatusDot, Tip } from '@hermes/plugin-sdk'
+import { cn, host, Button, Badge, EmptyState, StatusDot, Tip, Codicon } from '@hermes/plugin-sdk'
 import { ROUTES_AREA, SIDEBAR_NAV_AREA, PALETTE_AREA } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
 import { useState, useEffect, useRef, useMemo } from 'react'
@@ -156,6 +162,31 @@ function monoBlue(i, accent) {
  * Fallback sicuri se campi/API mancano: la UI resta grafica anche con dati vuoti.
  */
 const UFF_GREEN = '#4cc38a'
+
+/* Icona ufficiale SDK per ufficio (Codicon) + fallback unicode -------------
+ * Mapping: sviluppo=code, ricerca=search, produzione=tools, operations=shield,
+ * orchestratore=organization, knowledge-keeper=database, didattica=book,
+ * laboratorio=beaker, valutazione=checklist, flussi=play. Se Codicon non è
+ * disponibile nell'host, officeHead usa il glifo unicode di glyphFor. */
+function iconFor(name) {
+  const n = (typeof name === 'string' ? name : '').toLowerCase()
+  if (/orchestrat/.test(n)) return 'organization'
+  if (/keeper|gatekeeper|knowledge|archiv/.test(n)) return 'database'
+  if (/didatt|teach|tutor|learn|cors|formazione|scuola/.test(n)) return 'book'
+  if (/lab|beaker|speriment/.test(n)) return 'beaker'
+  if (/valut|checklist|review|qa|test|bug|pest/.test(n)) return 'checklist'
+  if (/fluss|workflow|pipeline|\bwf\b/.test(n)) return 'play'
+  if (/operations|ops\b|deploy|infra|server|sre/.test(n)) return 'shield'
+  if (/sviluppo|dev|code|front|back|software|app/.test(n)) return 'code'
+  if (/research|ricerca|search|studio|insight/.test(n)) return 'search'
+  if (/produz|tools|wrench|fabbr|maker/.test(n)) return 'tools'
+  if (/design|grafic|ui|ux|brand/.test(n)) return 'paintcan'
+  if (/data|db|database|analytic/.test(n)) return 'database'
+  if (/doc|writ|testi|content|blog/.test(n)) return 'book'
+  if (/market|growth|ads|social|seo/.test(n)) return 'megaphone'
+  if (/support|help|care|client/.test(n)) return 'heart'
+  return 'window'
+}
 
 function glyphFor(name) {
   const n = (typeof name === 'string' ? name : '').toLowerCase()
@@ -408,6 +439,8 @@ function elbow(x1, y1, x2, y2) {
 }
 
 function officeHead(o, st) {
+  const nm = (o && (o.name || o.id)) || ''
+  const useCod = (typeof Codicon !== 'undefined' && Codicon) ? true : false
   return jsxs('div', {
     key: 'h', className: 'flex items-center gap-1.5',
     children: [
@@ -415,16 +448,24 @@ function officeHead(o, st) {
         key: 'g',
         className: 'inline-flex items-center justify-center rounded-full shrink-0',
         style: {
-          width: 22, height: 22, background: 'transparent', fontSize: 11,
+          width: 22, height: 22, background: 'transparent', fontSize: 12,
           border: '1px solid var(--border, var(--ui-stroke-secondary))',
           color: 'var(--muted-foreground, var(--ui-text-tertiary))',
         },
-        children: glyphFor((o && (o.name || o.id)) || ''),
+        children: useCod ? jsx(Codicon, { name: iconFor(nm) }) : glyphFor(nm),
       }),
-      jsx('span', { key: 'n', className: 'text-xs font-medium truncate flex-1', children: (o && (o.name || o.id)) || '—' }),
+      jsx('span', { key: 'n', className: 'text-xs font-medium truncate flex-1', children: nm || '—' }),
       jsx(StatusDot, { key: 'd', state: st.flash ? 'online' : (st.active ? 'online' : 'idle') }),
     ],
   })
+}
+
+/* Task corrente in card: SOLO task dell'ufficio con status in_progress o
+ * blocked. Gli altri (todo/done/...) NON compaiono nella card universo;
+ * il board completo resta nella tab Progetti. I task t-ges* sono reali. */
+function isCurrentTask(t) {
+  const s = String((t && (t.status || t.state)) || '').toLowerCase()
+  return s === 'in_progress' || s === 'blocked'
 }
 
 function agentMini(a, onPick) {
@@ -641,7 +682,7 @@ function UfficiTab(props) {
     const ags = st.agents || []
     const shown = ags.slice(0, 4)
     const extra = ags.length - shown.length
-    const tks = (st.tasks || []).slice(0, 3)
+    const tks = (st.tasks || []).filter(isCurrentTask).slice(0, 3)
     const borderCol = st.flash
       ? 'var(--ui-success, ' + UFF_GREEN + ')'
       : (st.active ? 'var(--accent, var(--ui-accent))' : 'var(--border, var(--ui-stroke-secondary))')
@@ -672,7 +713,9 @@ function UfficiTab(props) {
           ? jsxs('div', { key: 'ag', className: 'flex flex-col gap-0.5', children: shown.map((a) => agentMini(a, (picked) => setSelAgent({ officeId: oid, agentId: picked.id || picked.name }))) })
           : jsx('div', { key: 'na', className: 'text-[0.65rem] text-(--ui-text-quaternary)', children: 'Nessun agente attivo' }),
         extra > 0 ? jsx('div', { key: 'more', className: 'text-[0.62rem] text-(--ui-text-quaternary)', children: '+' + extra + ' altri' }) : null,
-        tks.length ? jsxs('div', { key: 'tk', className: 'flex flex-col gap-1', children: tks.map((t) => taskMini(t)) }) : null,
+        tks.length
+          ? jsxs('div', { key: 'tk', className: 'flex flex-col gap-1', children: tks.map((t) => taskMini(t)) })
+          : jsx('div', { key: 'ntk', className: 'text-[0.65rem] text-(--ui-text-quaternary)', children: '— Task: niente in esecuzione ora' }),
         expanded ? jsxs('div', {
           key: 'x', className: 'flex flex-col gap-1.5 pt-1 border-t border-(--ui-stroke-secondary)',
           onClick: (ev) => ev.stopPropagation(),

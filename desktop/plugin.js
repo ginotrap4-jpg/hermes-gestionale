@@ -1,4 +1,4 @@
-/** Gestionale Hermes — desktop plugin v0.4.3.
+/** Gestionale Hermes — desktop plugin v0.4.4.
  * Sidebar /gestionale con tab: Uffici (top row Orchestratore + Knowledge Keeper,
  * worker force-directed con card rettangolari, glifi, mini-task, elbow lines),
  * Chat, Automazioni (last_run_at + Esegui ora + Log), Output (file explorer),
@@ -7,6 +7,13 @@
  * fallback a fetch http://127.0.0.1:8790 + polling (3s, 2s per il grafo).
  * Robusto a backend offline (EmptyState). Stile: solo variabili tema,
  * mai colori hardcoded (canvas: toni di blu derivati da --accent).
+ * v0.4.4: (1) drag stabile: card in drag/inerzia esclusa da OGNI fisica e
+ * anti-overlap (flag frozenId), mai rAF concorrente che la sposta; (2) inerzia
+ * leggera al lancio (velocity media ~80ms, damping 0.82/frame, cutoff
+ * ~0.02px/frame, clamp 28px/frame), decelerazione libera senza forze, una sola
+ * passata anti-overlap soft dopo il fermo; (3) no-vibra: soglia morta <2px
+ * negli spostamenti reflow, il loop si ferma; (4) niente drag se il mousedown
+ * e su input/textarea/select/contenteditable o con selezione testo attiva.
  * v0.4.3: (1) NESSUNO scale()/zoom sul contenitore: posizioni snap a px
  * interi (Math.round), misure via offsetWidth/offsetHeight (non getBoundingRect
  * su elemento trasformato), SVG in spazio pixel 1:1 (no viewBox stretch) +
@@ -260,7 +267,10 @@ function msgTs(m) {
   return t
 }
 
-/* Layout force-directed v0.4.3 in spazio 0..100 (solo worker) ----------------
+/* Layout force-directed v0.4.4 in spazio 0..100 (solo worker) ----------------
+ * (0) DRAG STABILE: card in drag/inerzia esclusa da ogni forza e reflow via
+ * frozenId; inerzia post-lancio (damping 0.82, cutoff ~0.02px/frame, clamp);
+ * soglia morta <2px nel reflow (niente vibrazione); no-drag su input/selezione.
  * (1) NESSUNO scale()/zoom: posizioni scritte come translate3d con px INTERI
  * (Math.round) + translate(-50%,-50%) su larghezze pari (250/420) -> testo
  * nitido, niente subpixel blur; misure via offsetWidth/offsetHeight (layout
@@ -293,6 +303,7 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
   const rafRef = useRef(0)
   const framesRef = useRef(0)
   const dragRef = useRef(null)
+  const inertiaRef = useRef({})
   const suppressRef = useRef({})
   const [, setStruct] = useState(0)
   const idsKey = (ids || []).join(',')
@@ -306,12 +317,22 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
       return false
     } catch (e) { return false }
   }
+  function hasInertia() {
+    try { return Object.keys(inertiaRef.current || {}).length > 0 } catch (e) { return false }
+  }
+  function frozenId(id) {
+    // card in drag o in inerzia: esclusa da OGNI fisica e anti-overlap
+    try {
+      if (dragRef.current && dragRef.current.id === id) return true
+      if (inertiaRef.current && inertiaRef.current[id]) return true
+    } catch (e) { /* noop */ }
+    return false
+  }
   function kick() {
-    if (dragRef.current) return // drag scrive diretto, niente rAF concorrente
     framesRef.current = 0
-    if (!hasEffActive()) {
-      try { resolveOverlapOnce(); applyToDom() } catch (e) { /* pose statiche */ }
-      return // ZERO rAF quando tutti inattivi
+    if (!hasEffActive() && !hasInertia()) {
+      try { resolveOverlapOnce(false); applyToDom() } catch (e) { /* pose statiche */ }
+      return // ZERO rAF quando tutti inattivi e niente inerzia
     }
     if (!rafRef.current && typeof requestAnimationFrame !== 'undefined') {
       try { rafRef.current = requestAnimationFrame(frame) } catch (e) { rafRef.current = 0 }
@@ -374,9 +395,11 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
       } catch (e2) { /* noop */ }
     })
   }
-  function resolveOverlapOnce() {
+  function resolveOverlapOnce(soft) {
     const p = posRef.current
     const list = Object.keys(p)
+    const s = areaSize.current || { w: 800, h: 500 }
+    const cap = soft ? 1.5 : 6 // passata soft post-inerzia: spostamento leggero
     let i, j
     for (i = 0; i < list.length; i++) {
       for (j = i + 1; j < list.length; j++) {
@@ -385,6 +408,7 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
         const A = p[Aid]
         const B = p[Bid]
         if (!A || !B) continue
+        if (frozenId(Aid) || frozenId(Bid)) continue // drag/inerzia: mai toccare
         const ea = effActive(Aid)
         const eb = effActive(Bid)
         if (!ea && !eb) continue // entrambi fermi: nessuna forza
@@ -395,13 +419,15 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
         if (ox > 0 && oy > 0) {
           if (ox < oy) {
             const sgn = (A.x >= B.x ? 1 : -1) || 1
-            const sh = Math.min(ox / 2 + 0.4, 6)
+            const sh = Math.min(ox / 2 + 0.4, cap)
+            if ((sh / 100) * (s.w || 800) < 2) continue // soglia morta <2px: niente vibrazione
             if (ea && eb) { A.x += sgn * sh; B.x -= sgn * sh }
             else if (ea) { A.x += sgn * sh * 2 }
             else { B.x -= sgn * sh * 2 }
           } else {
             const sgn = (A.y >= B.y ? 1 : -1) || 1
-            const sh = Math.min(oy / 2 + 0.4, 6)
+            const sh = Math.min(oy / 2 + 0.4, cap)
+            if ((sh / 100) * (s.h || 500) < 2) continue // soglia morta <2px: niente vibrazione
             if (ea && eb) { A.y += sgn * sh; B.y -= sgn * sh }
             else if (ea) { A.y += sgn * sh * 2 }
             else { B.y -= sgn * sh * 2 }
@@ -413,23 +439,24 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
   }
   function frame() {
     rafRef.current = 0
-    if (dragRef.current) return // drag in corso: nessun tick concorrente
     const p = posRef.current
     const list = Object.keys(p)
     if (!list.length) return
-    if (++framesRef.current > 600) return // guardia anti-loop
-    if (!hasEffActive()) { try { applyToDom() } catch (e) { /* noop */ } return } // pose statiche
+    if (++framesRef.current > 600) { try { inertiaRef.current = {} } catch (e) { /* noop */ } return } // guardia anti-loop
+    if (!hasEffActive() && !hasInertia()) { try { applyToDom() } catch (e) { /* noop */ } return } // pose statiche
     const edgeList = edgesRef.current || []
     const linked = {}
     edgeList.forEach((e) => { linked[e.a + '|' + e.b] = e; linked[e.b + '|' + e.a] = e })
+    const area = areaSize.current || { w: 800, h: 500 }
     let i, j
     for (i = 0; i < list.length; i++) {
       const Aid = list[i]
-      if (!effActive(Aid)) continue
+      if (!effActive(Aid) || frozenId(Aid)) continue // drag/inerzia: zero forze
       const A = p[Aid]
       if (!A) continue
       for (j = i + 1; j < list.length; j++) {
         const Bid = list[j]
+        if (frozenId(Bid)) continue // mai spingere contro la card in drag/inerzia
         if (!effActive(Bid) && !effActive(Aid)) continue
         const B = p[Bid]
         if (!B) continue
@@ -450,7 +477,7 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
       }
     }
     edgeList.forEach((e) => {
-      if (!effActive(e.a) || !effActive(e.b)) return // edge solo tra effettivi
+      if (!effActive(e.a) || !effActive(e.b) || frozenId(e.a) || frozenId(e.b)) return // edge solo tra effettivi liberi
       const A = p[e.a]
       const B = p[e.b]
       if (!A || !B) return
@@ -476,21 +503,25 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
         const ea = effActive(Aid)
         const eb = effActive(Bid)
         if (!ea && !eb) continue
+        if (frozenId(Aid) || frozenId(Bid)) continue // anti-overlap mai sulla card in drag/inerzia
         const sa = sizeOf(Aid)
         const sb = sizeOf(Bid)
         const ox = (sa.hw + sb.hw) - Math.abs(A.x - B.x)
         const oy = (sa.hh + sb.hh) - Math.abs(A.y - B.y)
         if (ox > 0 && oy > 0) {
-          pushed = true
           if (ox < oy) {
             const sgn = (A.x >= B.x ? 1 : -1) || 1
             const sh = Math.min(ox / 2 + 0.4, 6)
+            if ((sh / 100) * (area.w || 800) < 2) continue // soglia morta <2px: niente vibrazione
+            pushed = true
             if (ea && eb) { A.x += sgn * sh; B.x -= sgn * sh; A.vx *= 0.6; B.vx *= 0.6 }
             else if (ea) { A.x += sgn * sh * 2; A.vx *= 0.6 }
             else { B.x -= sgn * sh * 2; B.vx *= 0.6 }
           } else {
             const sgn = (A.y >= B.y ? 1 : -1) || 1
             const sh = Math.min(oy / 2 + 0.4, 6)
+            if ((sh / 100) * (area.h || 500) < 2) continue // soglia morta <2px: niente vibrazione
+            pushed = true
             if (ea && eb) { A.y += sgn * sh; B.y -= sgn * sh; A.vy *= 0.6; B.vy *= 0.6 }
             else if (ea) { A.y += sgn * sh * 2; A.vy *= 0.6 }
             else { B.y -= sgn * sh * 2; B.vy *= 0.6 }
@@ -502,6 +533,17 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
     list.forEach((id) => {
       const P = p[id]
       if (!P) return
+      const ine = (inertiaRef.current || {})[id]
+      if (ine) {
+        // inerzia post-lancio: scorrimento libero decelerato, NESSUNA forza della fisica
+        P.x = Math.min(97, Math.max(1, P.x + ine.vx))
+        P.y = Math.min(97, Math.max(1, P.y + ine.vy))
+        if (P.x <= 1 || P.x >= 97) ine.vx = 0
+        if (P.y <= 1 || P.y >= 97) ine.vy = 0
+        ine.vx *= 0.82; ine.vy *= 0.82 // damping lancio
+        return
+      }
+      if (frozenId(id)) { P.vx = 0; P.vy = 0; return } // in drag: scrive solo il mousemove
       if (!effActive(id)) { P.vx = 0; P.vy = 0; return } // fermi: niente gravita/confini
       P.vx += (50 - P.x) * 0.004
       P.vy += (60 - P.y) * 0.004 // centro piu in basso: aria verso la top row
@@ -512,21 +554,44 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
       if (dd > maxD) maxD = dd
       P.x = nx; P.y = ny
     })
+    // inerzia esaurita (soglia ~0.02px/frame): una sola passata anti-overlap soft, poi stop
+    let stoppedInertia = false
+    try {
+      Object.keys(inertiaRef.current || {}).forEach((id) => {
+        const ine = inertiaRef.current[id]
+        if (!ine) return
+        const spx = Math.max(Math.abs(ine.vx) / 100 * (area.w || 800), Math.abs(ine.vy) / 100 * (area.h || 500))
+        if (spx < 0.05) {
+          delete inertiaRef.current[id]
+          stoppedInertia = true
+          if (posRef.current[id]) { posRef.current[id].vx = 0; posRef.current[id].vy = 0 }
+        }
+      })
+    } catch (e) { /* inerzia mai fatale */ }
+    if (stoppedInertia) { try { resolveOverlapOnce(true) } catch (e) { /* una sola passata soft */ } }
     applyToDom()
-    if (pushed || maxD > 0.08) {
+    if (pushed || maxD > 0.08 || hasInertia()) {
       try { rafRef.current = requestAnimationFrame(frame) } catch (e) { rafRef.current = 0 }
     }
   }
   function startDrag(id, ev) {
     try {
       if (ev && ev.button !== undefined && ev.button !== 0) return
+      try {
+        // selezione testo: niente drag se il mousedown e su input/testo selezionabile (click ok)
+        const t = ev && ev.target
+        if (t && t.closest && t.closest('input,textarea,select,[contenteditable]')) return
+        const sel = (typeof window !== 'undefined' && window.getSelection) ? window.getSelection() : null
+        if (sel && !sel.isCollapsed) return
+      } catch (e) { /* check best-effort: drag normale */ }
       const P = posRef.current[id]
       const s = areaSize.current || { w: 800, h: 500 }
       if (!P || !s.w) return
+      try { if (inertiaRef.current && inertiaRef.current[id]) delete inertiaRef.current[id] } catch (e) { /* il drag cancella l'inerzia */ }
       const sx = (ev && ev.clientX !== undefined) ? ev.clientX : 0
       const sy = (ev && ev.clientY !== undefined) ? ev.clientY : 0
       const dead = isExp(id) ? 10 : 5
-      dragRef.current = { id, sx, sy, ox: P.x, oy: P.y, dead, moved: false }
+      dragRef.current = { id, sx, sy, ox: P.x, oy: P.y, dead, moved: false, hist: [] }
       try {
         if (ev && ev.currentTarget && ev.currentTarget.classList) ev.currentTarget.classList.add('uff-drag')
       } catch (e) { /* noop */ }
@@ -539,6 +604,13 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
           const dist = Math.sqrt(dxPx * dxPx + dyPx * dyPx)
           if (!dr.moved && dist < dr.dead) return // deadzone: ancora click
           dr.moved = true
+          try {
+            // campiona gli ultimi spostamenti (~80ms) per la velocity al rilascio
+            const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()
+            dr.hist.push({ t: now, x: me.clientX || 0, y: me.clientY || 0 })
+            while (dr.hist.length > 8) dr.hist.shift()
+            while (dr.hist.length > 2 && (now - dr.hist[0].t) > 120) dr.hist.shift()
+          } catch (e) { /* campionamento best-effort */ }
           const Q = posRef.current[id]
           if (!Q) return
           Q.x = Math.min(97, Math.max(1, dr.ox + (dxPx / s.w) * 100))
@@ -561,7 +633,27 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
           try { window.removeEventListener('mouseup', onUp) } catch (e2) { /* noop */ }
           if (wasMoved) {
             suppressRef.current[id] = Date.now()
-            kick() // un solo reflow dopo il drop
+            // inerzia leggera: velocity media degli ultimi campioni (~80ms), clamp anti-lanci
+            try {
+              const h = (dr && dr.hist) || []
+              if (h.length >= 2 && posRef.current[id]) {
+                const a = h[0]
+                const b = h[h.length - 1]
+                const dt = Math.max(1, b.t - a.t)
+                if (dt >= 8) {
+                  let vx = (((b.x - a.x) / dt) * 16.7) // px/frame
+                  let vy = (((b.y - a.y) / dt) * 16.7)
+                  const sp = Math.sqrt(vx * vx + vy * vy)
+                  const MAXV = 28 // clamp: niente lanci violenti
+                  if (sp > MAXV) { vx *= MAXV / sp; vy *= MAXV / sp }
+                  if (sp >= 1.5) {
+                    const s2 = areaSize.current || { w: 800, h: 500 }
+                    inertiaRef.current[id] = { vx: (vx / (s2.w || 800)) * 100, vy: (vy / (s2.h || 500)) * 100 }
+                  }
+                }
+              }
+            } catch (e) { /* niente inerzia: drop secco */ }
+            kick() // loop per l'inerzia, o un solo reflow dopo il drop secco
           }
         } catch (e) { /* noop */ }
       }
@@ -584,6 +676,7 @@ function useWorkerLayout(ids, edges, expandedIds, activeIds) {
       }
     })
     Object.keys(pr).forEach((k) => { if ((ids || []).indexOf(k) < 0) delete pr[k] })
+    Object.keys(inertiaRef.current || {}).forEach((k) => { if ((ids || []).indexOf(k) < 0) delete inertiaRef.current[k] })
     setStruct((v) => v + 1)
     kick()
     return undefined
